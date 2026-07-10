@@ -8,6 +8,8 @@ from adapters.accela.constants import URLS as ACCELA_URLS
 from adapters.accela.adapter import AccelaAdapter
 from adapters.base.base_adapter import BaseAdapter
 from adapters.detector import AdapterDetector, build_adapters
+from adapters.smartgov.constants import SMARTGOV_URLS
+from adapters.smartgov.adapter import SmartGovAdapter
 from db.mongo_client import MongoStore
 from utils.logger import get_logger
 
@@ -68,6 +70,35 @@ def get_source_metadata(source_url: str) -> dict[str, str | None]:
     }
 
 
+def load_smartgov_urls(counties: Iterable[str] | None = None) -> list[str]:
+    """Return SmartGov search URLs, optionally filtered by county key."""
+    county_filter = {value.strip().lower() for value in (counties or []) if value.strip()}
+    selected_urls: list[str] = []
+    for county_key, county_config in SMARTGOV_URLS.items():
+        if county_filter and county_key.lower() not in county_filter:
+            continue
+        url = county_config.get("search_url")
+        if url:
+            selected_urls.append(url)
+    return selected_urls
+
+
+def get_smartgov_source_metadata(source_url: str) -> dict[str, str | None]:
+    """Return county metadata for a SmartGov search URL."""
+    for county_key, county_config in SMARTGOV_URLS.items():
+        if county_config.get("search_url") == source_url:
+            return {
+                "agency_key": county_key,
+                "county_name": county_config.get("county_name"),
+                "module_name": "smartgov",
+            }
+    return {
+        "agency_key": None,
+        "county_name": None,
+        "module_name": None,
+    }
+
+
 def limit_urls(urls: list[str], limit: int | None = None) -> list[str]:
     if limit is None or limit <= 0:
         return urls
@@ -77,8 +108,9 @@ def limit_urls(urls: list[str], limit: int | None = None) -> list[str]:
 def crawl(urls: Iterable[str], headed: bool = False) -> None:
     adapters: list[BaseAdapter] = build_adapters()
     accela_adapter = next((adapter for adapter in adapters if isinstance(adapter, AccelaAdapter)), None)
+    smartgov_adapter = next((adapter for adapter in adapters if isinstance(adapter, SmartGovAdapter)), None)
     for adapter in adapters:
-        if isinstance(adapter, AccelaAdapter):
+        if isinstance(adapter, (AccelaAdapter, SmartGovAdapter)):
             adapter.headed = headed
     detector = AdapterDetector(adapters)
     store = MongoStore()
@@ -89,11 +121,19 @@ def crawl(urls: Iterable[str], headed: bool = False) -> None:
             continue
 
         run_id = None
-        source_metadata = get_source_metadata(source_url)
+        is_smartgov = "smartgovcommunity" in source_url.lower()
+        source_metadata = (
+            get_smartgov_source_metadata(source_url) if is_smartgov else get_source_metadata(source_url)
+        )
         logger.info("Crawling %s", source_url)
 
         try:
-            bootstrap_adapter = accela_adapter if "accela" in source_url.lower() and accela_adapter else adapters[0]
+            if is_smartgov and smartgov_adapter:
+                bootstrap_adapter: BaseAdapter = smartgov_adapter
+            elif "accela" in source_url.lower() and accela_adapter:
+                bootstrap_adapter = accela_adapter
+            else:
+                bootstrap_adapter = adapters[0]
             html = bootstrap_adapter.fetch_html(source_url)
             soup = bootstrap_adapter.parse(html)
 
@@ -176,7 +216,7 @@ def parse_args() -> argparse.Namespace:
     default_urls_file = Path(__file__).resolve().parent / "urls.txt"
     parser.add_argument(
         "--source",
-        choices=("accela_constants", "file"),
+        choices=("accela_constants", "smartgov_constants", "file"),
         default="accela_constants",
         help="Where to load URLs from. Defaults to the Accela URLS constant.",
     )
@@ -204,9 +244,15 @@ def parse_args() -> argparse.Namespace:
         help="Module name filter, e.g. Building, Planning, Enforcement.",
     )
     parser.add_argument(
+        "--county",
+        action="append",
+        default=[],
+        help="SmartGov county key from adapters/smartgov/constants.py, e.g. alexander_county.",
+    )
+    parser.add_argument(
         "--headed",
         action="store_true",
-        help="Open Accela pages in a visible Playwright browser window.",
+        help="Open pages in a visible Playwright browser window.",
     )
     parser.add_argument(
         "--limit",
@@ -222,6 +268,8 @@ def main() -> None:
 
     if args.url:
         target_urls = args.url
+    elif args.source == "smartgov_constants":
+        target_urls = load_smartgov_urls(args.county)
     elif args.source == "accela_constants":
         target_urls = load_accela_urls(args.agency, args.module)
     else:

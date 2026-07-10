@@ -9,12 +9,14 @@ from adapters.civicplus.adapter import CivicPlusAdapter
 from adapters.generic.adapter import GenericAdapter
 from adapters.mygovernmentonline.adapter import MyGovernmentOnlineAdapter
 from adapters.opengov.adapter import OpenGovAdapter
+from adapters.smartgov.adapter import SmartGovAdapter
 from adapters.tyler_energov.adapter import TylerEnerGovAdapter
 
 
 def build_adapters() -> list[BaseAdapter]:
     return [
         AccelaAdapter(),
+        SmartGovAdapter(),
         MyGovernmentOnlineAdapter(),
         TylerEnerGovAdapter(),
         OpenGovAdapter(),
