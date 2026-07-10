@@ -20,6 +20,9 @@ MONGODB_DB = os.getenv("MONGODB_DB", "crawlpy")
 MONGODB_PARAMS = os.getenv("MONGODB_PARAMS", "")
 
 REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "20"))
+ADMIN_API_BASE_URL = os.getenv("ADMIN_API_BASE_URL", "")
+ADMIN_API_IMPORT_PATH = os.getenv("ADMIN_API_IMPORT_PATH", "/api/admin/permits/import")
+ADMIN_API_TOKEN = os.getenv("ADMIN_API_TOKEN", "")
 USER_AGENT = os.getenv(
     "USER_AGENT",
     "Mozilla/5.0 (compatible; CrawlPy/1.0; +https://example.local)",

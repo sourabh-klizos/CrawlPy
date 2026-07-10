@@ -162,3 +162,47 @@ class MongoStore:
                 "raw_items": raw_items,
             }
         )
+
+    def find_already_pushed(
+        self,
+        payload_hash: str,
+        identity_filter: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        identity_query = {f"identity_filter.{key}": value for key, value in identity_filter.items()}
+        return self._collection("already_pushed").find_one(
+            {
+                "$or": [
+                    {"payload_hash": payload_hash},
+                    identity_query,
+                ]
+            }
+        )
+
+    def save_already_pushed(
+        self,
+        *,
+        permit_id: Any,
+        payload_hash: str,
+        identity_filter: dict[str, Any],
+        payload_record: dict[str, Any],
+        payload_metadata: dict[str, Any],
+        api_response: dict[str, Any],
+    ) -> None:
+        self._collection("already_pushed").update_one(
+            {"permit_id": permit_id},
+            {
+                "$set": {
+                    "permit_id": permit_id,
+                    "payload_hash": payload_hash,
+                    "identity_filter": identity_filter,
+                    "payload_record": payload_record,
+                    "payload_metadata": payload_metadata,
+                    "api_response": api_response,
+                    "updated_at": datetime.now(timezone.utc),
+                },
+                "$setOnInsert": {
+                    "created_at": datetime.now(timezone.utc),
+                },
+            },
+            upsert=True,
+        )
