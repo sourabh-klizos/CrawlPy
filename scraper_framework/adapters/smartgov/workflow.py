@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import datetime
 from typing import Any, Callable
+from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 from dateutil.relativedelta import relativedelta
@@ -619,15 +621,32 @@ class SmartGovPlaywrightWorkflow:
             if detail_link:
                 detail_page = await page.context.new_page()
                 try:
+                    print(
+                        f"Opening direct detail page for {record.get('record_number')}: "
+                        f"{detail_link}"
+                    )
                     await detail_page.goto(
                         detail_link,
                         wait_until="domcontentloaded",
                         timeout=BROWSER_NAVIGATION_TIMEOUT_MS,
                     )
                     return await self.parse_open_detail_page(detail_page)
+                except Exception as exc:  # noqa: BLE001
+                    await self.print_detail_failure_debug(
+                        detail_page,
+                        record,
+                        option_text,
+                        page_num,
+                        f"direct detail URL failed: {exc}",
+                    )
+                    raise
                 finally:
                     await detail_page.close()
 
+            print(
+                f"No direct detail URL parsed for {record.get('record_number')}; "
+                "falling back to search-page detail lookup."
+            )
             return await self.fetch_detail_fields_by_click(
                 page,
                 record,
@@ -649,6 +668,7 @@ class SmartGovPlaywrightWorkflow:
             return {}
 
         detail_page = await page.context.new_page()
+        debug_printed = False
         try:
             await self.goto_search_page(detail_page, url)
             dropdown = await self.find_type_dropdown(detail_page)
@@ -663,21 +683,184 @@ class SmartGovPlaywrightWorkflow:
             if await link.count() == 0:
                 link = detail_page.locator("a").filter(has_text=str(record_number)).first
             if await link.count() == 0 or not await link.is_visible():
+                await self.print_detail_failure_debug(
+                    detail_page,
+                    record,
+                    option_text,
+                    page_num,
+                    f"record link not found for {record_number}",
+                )
+                debug_printed = True
                 raise RuntimeError(f"Could not find detail link for {record_number}")
 
-            try:
-                async with detail_page.expect_navigation(
+            detail_url = await self.extract_detail_url_from_link(link, url)
+            if detail_url:
+                await detail_page.goto(
+                    detail_url,
                     wait_until="domcontentloaded",
                     timeout=BROWSER_NAVIGATION_TIMEOUT_MS,
-                ):
-                    await link.click()
-            except PlaywrightTimeoutError:
-                pass
+                )
+                return await self.parse_open_detail_page(detail_page)
 
-            await self.wait_for_detail_page(detail_page, record_number)
-            return await self.parse_open_detail_page(detail_page)
+            await link.scroll_into_view_if_needed(timeout=BROWSER_RESULTS_TIMEOUT_MS)
+            return await self.click_record_link_and_parse_detail(
+                detail_page,
+                link,
+                record_number,
+            )
+        except Exception as exc:  # noqa: BLE001
+            if not debug_printed:
+                await self.print_detail_failure_debug(
+                    detail_page,
+                    record,
+                    option_text,
+                    page_num,
+                    f"fallback detail lookup failed: {exc}",
+                )
+            raise
         finally:
             await detail_page.close()
+
+    async def print_detail_failure_debug(
+        self,
+        page: Any,
+        record: dict[str, Any],
+        option_text: str,
+        page_num: int,
+        reason: str,
+    ) -> None:
+        record_number = record.get("record_number")
+        print("SmartGov detail failure debug:")
+        print(f"  reason: {reason}")
+        print(f"  record_number: {record_number}")
+        print(f"  permit_type: {option_text}")
+        print(f"  expected_results_page: {page_num}")
+        print(f"  parsed_detail_link: {record.get('detail_link')}")
+
+        try:
+            print(f"  current_url: {page.url}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  current_url: <unavailable: {exc}>")
+
+        try:
+            print(f"  page_title: {await page.title()}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  page_title: <unavailable: {exc}>")
+
+        try:
+            body_text = await page.locator("body").inner_text(timeout=3000)
+            body_preview = " ".join(body_text.split())[:1200]
+            target_present = bool(record_number and record_number in body_text)
+            print(f"  target_record_present_in_body: {target_present}")
+            print(f"  body_preview: {body_preview}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  body_preview: <unavailable: {exc}>")
+
+        try:
+            visible_record_links = await self.visible_record_link_debug(page, limit=25)
+            print(f"  visible_record_links: {visible_record_links}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  visible_record_links: <unavailable: {exc}>")
+
+    async def visible_record_link_debug(self, page: Any, limit: int) -> list[str]:
+        links = page.locator("a")
+        visible_links: list[str] = []
+        for index in range(await links.count()):
+            link = links.nth(index)
+            try:
+                if not await link.is_visible():
+                    continue
+                text = " ".join((await link.inner_text()).split())
+            except Exception:  # noqa: BLE001
+                continue
+            if not text or not self.smartgov_record_link_pattern.match(text):
+                continue
+            visible_links.append(text)
+            if len(visible_links) >= limit:
+                break
+        return visible_links
+
+    async def extract_detail_url_from_link(self, link: Any, source_url: str) -> str | None:
+        attribute_blob = await link.evaluate(
+            """element => Array.from(element.attributes)
+                .map(attribute => `${attribute.name}=${attribute.value}`)
+                .join(" ")"""
+        )
+        match = re.search(
+            r"(https?://[^\s'\"<>]+/PermittingPublic/PermitLandingPagePublic/Index/[^\s'\"<>]+"
+            r"|/?PermittingPublic/PermitLandingPagePublic/Index/[^\s'\"<>]+)",
+            attribute_blob,
+        )
+        if match:
+            raw_url = match.group(1)
+            if raw_url.startswith("http"):
+                return raw_url
+            return urljoin(source_url, f"/{raw_url.lstrip('/')}")
+
+        detail_match = re.search(
+            r"Detail/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+            r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})",
+            attribute_blob,
+        )
+        if detail_match:
+            detail_id = detail_match.group(1)
+            return urljoin(
+                source_url,
+                f"/PermittingPublic/PermitLandingPagePublic/Index/{detail_id}?_conv=1",
+            )
+
+        return None
+
+    async def click_record_link_and_parse_detail(
+        self,
+        page: Any,
+        link: Any,
+        record_number: str,
+    ) -> dict[str, Any]:
+        popup_task = asyncio.create_task(
+            page.context.wait_for_event("page", timeout=BROWSER_RESULTS_TIMEOUT_MS)
+        )
+        detail_task = asyncio.create_task(self.wait_for_detail_page(page, record_number))
+        try:
+            await link.click()
+            done, pending = await asyncio.wait(
+                {popup_task, detail_task},
+                timeout=BROWSER_RESULTS_TIMEOUT_MS,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            if popup_task in done and popup_task.exception() is None:
+                popup_page = popup_task.result()
+                for pending_task in pending:
+                    pending_task.cancel()
+                try:
+                    await popup_page.wait_for_load_state(
+                        "domcontentloaded",
+                        timeout=BROWSER_NAVIGATION_TIMEOUT_MS,
+                    )
+                    return await self.parse_open_detail_page(popup_page)
+                finally:
+                    await popup_page.close()
+
+            if detail_task in done and detail_task.exception() is None:
+                for pending_task in pending:
+                    pending_task.cancel()
+                return await self.parse_open_detail_page(page)
+
+            for done_task in done:
+                if not done_task.cancelled() and done_task.exception() is not None:
+                    done_task.exception()
+            for pending_task in pending:
+                pending_task.cancel()
+
+            await link.evaluate("element => element.click()")
+            await self.wait_for_detail_page(page, record_number)
+            return await self.parse_open_detail_page(page)
+        except Exception:
+            for task in (popup_task, detail_task):
+                if not task.done():
+                    task.cancel()
+            raise
 
     async def parse_open_detail_page(self, page: Any) -> dict[str, Any]:
         try:

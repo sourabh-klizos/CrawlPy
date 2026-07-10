@@ -15,6 +15,12 @@ TABLE_SELECTORS = [
     "table",
 ]
 SMARTGOV_RECORD_NUMBER_RE = re.compile(r"^(?:[A-Z]+-)?\d{2,4}(?:-\d{2,})+")
+SMARTGOV_DETAIL_ACTION_RE = re.compile(
+    r"(https?://[^\s'\"<>]+/PermittingPublic/PermitLandingPagePublic/Index/[^\s'\"<>]+"
+    r"|/?PermittingPublic/PermitLandingPagePublic/Index/[^\s'\"<>]+"
+    r"|Detail/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
+)
 
 
 def parse_rows(soup: BeautifulSoup, source_url: str) -> list[dict[str, Any]]:
@@ -67,7 +73,10 @@ def parse_rows(soup: BeautifulSoup, source_url: str) -> list[dict[str, Any]]:
                     link_tag = cells[record_index].find("a")
                     if link_tag:
                         raw_link = link_tag.get("href", "").strip()
-                        record_link = _normalized_link(raw_link, source_url)
+                        record_link = _smartgov_detail_link(link_tag, source_url) or _normalized_link(
+                            raw_link,
+                            source_url,
+                        )
 
                         span_tag = link_tag.find("span")
                         record_num = span_tag.text.strip() if span_tag else link_tag.get_text(" ", strip=True)
@@ -133,7 +142,10 @@ def parse_result_list(soup: BeautifulSoup, source_url: str) -> list[dict[str, An
             continue
 
         seen_record_numbers.add(record_number)
-        detail_link = _normalized_link(link_tag["href"], source_url)
+        detail_link = _smartgov_detail_link(link_tag, source_url) or _normalized_link(
+            link_tag["href"],
+            source_url,
+        )
         container = _result_container(link_tag)
         container_text = _clean_text(container.get_text("\n", strip=True)) if container else ""
         lines = [
@@ -349,8 +361,38 @@ def _first_link_url(cells: list[Any], source_url: str) -> str | None:
     for cell in cells:
         link_tag = cell.find("a")
         if link_tag and link_tag.get("href"):
-            return _normalized_link(link_tag["href"], source_url)
+            return _smartgov_detail_link(link_tag, source_url) or _normalized_link(
+                link_tag["href"],
+                source_url,
+            )
     return None
+
+
+def _smartgov_detail_link(link_tag: Any, source_url: str) -> str | None:
+    attribute_blob = " ".join(
+        str(value)
+        for value in (
+            link_tag.get("href"),
+            link_tag.get("onclick"),
+            link_tag.get("data-url"),
+            link_tag.get("data-href"),
+        )
+        if value
+    )
+    match = SMARTGOV_DETAIL_ACTION_RE.search(attribute_blob)
+    if not match:
+        return None
+
+    raw_link = match.group(1).strip()
+    if raw_link.startswith("http"):
+        return raw_link
+    if raw_link.startswith("Detail/"):
+        detail_id = raw_link.removeprefix("Detail/")
+        return urljoin(
+            source_url,
+            f"/PermittingPublic/PermitLandingPagePublic/Index/{detail_id}?_conv=1",
+        )
+    return urljoin(source_url, f"/{raw_link.lstrip('/')}")
 
 
 def _normalized_link(raw_link: str | None, source_url: str) -> str | None:
