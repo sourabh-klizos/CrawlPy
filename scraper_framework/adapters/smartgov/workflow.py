@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
-from typing import Any
+from typing import Any, Callable
 
+from bs4 import BeautifulSoup
 from dateutil.relativedelta import relativedelta
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
@@ -11,10 +12,17 @@ from .constants import (
     BROWSER_NAVIGATION_TIMEOUT_MS,
     BROWSER_POSTBACK_TIMEOUT_MS,
     BROWSER_RESULTS_TIMEOUT_MS,
+    COUNTY_PERMIT_TYPE_GROUPS,
     MAX_CONCURRENT_PAGES,
-    PERMIT_TYPE_GROUPS,
     SEARCH_WINDOW_YEARS,
+    SMARTGOV_URLS,
     WORKER_PAGE_NAVIGATION_RETRIES,
+)
+from .parser import (
+    SMARTGOV_RECORD_NUMBER_RE,
+    merge_detail_fields,
+    parse_detail_fields,
+    parse_rows,
 )
 
 
@@ -28,19 +36,31 @@ class SmartGovPlaywrightWorkflow:
     start_date_selector = "#ctl00_PlaceHolderMain_generalSearchForm_txtGSStartDate"
     end_date_selector = "#ctl00_PlaceHolderMain_generalSearchForm_txtGSEndDate"
     search_button_selector = "#ctl00_PlaceHolderMain_btnNewSearch"
-    results_page_element_indicator = ".ACA_GridView, #ctl00_PlaceHolderMain_DataGrid"
-    pagination_link_selector = ".aca_pagination td.aca_pagination_td a"
-    pagination_cell_selector = ".aca_pagination td.aca_pagination_td"
-    pagination_more_text = "..."
-    pagination_next_text = "Next"
+    results_page_element_indicator = ".ACA_GridView, #ctl00_PlaceHolderMain_DataGrid, table.table, table"
+    smartgov_record_link_pattern = SMARTGOV_RECORD_NUMBER_RE
+    pagination_link_selector = (
+        ".aca_pagination td.aca_pagination_td a, "
+        "nav[aria-label*='Pagination'] a, "
+        "nav[aria-label*='pagination'] a, "
+        ".pagination a, "
+        "ul.pagination a, "
+        "a.page-link"
+    )
+    pagination_cell_selector = ".aca_pagination td.aca_pagination_td, .pagination li, ul.pagination li"
+    pagination_more_texts = ("...", "…")
+    pagination_next_texts = ("Next", "›", ">", "»")
 
     def __init__(self, request_timeout_ms: int) -> None:
         self.request_timeout_ms = request_timeout_ms
         self.result_pages_html: list[str] = []
+        self.result_record_batches: list[list[dict[str, Any]]] = []
+        self.result_batch_callback: Callable[[list[dict[str, Any]]], None] | None = None
         self.page_semaphore = asyncio.Semaphore(MAX_CONCURRENT_PAGES)
+        self.detail_page_semaphore = asyncio.Semaphore(MAX_CONCURRENT_PAGES)
 
     async def run(self, page: Any, url: str) -> str:
         self.result_pages_html = []
+        self.result_record_batches = []
         await self.before_navigation(page, url)
         await self.goto_search_page(page, url)
         await self.after_navigation(page, url)
@@ -57,38 +77,68 @@ class SmartGovPlaywrightWorkflow:
         """Hook immediately after the initial page load finishes."""
 
     async def apply_site_logic(self, page: Any, url: str) -> None:
-        permit_types = self.get_target_permit_types()
+        permit_type_groups = self.get_permit_type_groups(url)
+        permit_types = self.get_target_permit_types(permit_type_groups)
         print(f"Permit types to scrape ({len(permit_types)} total): {permit_types}")
 
-        # Build a reverse lookup: permit_type_label -> category name (for logging)
-        type_to_category: dict[str, str] = {
-            permit_type: category
-            for category, types in PERMIT_TYPE_GROUPS.items()
-            for permit_type in types
-        }
+        type_to_category = self.get_type_to_category(permit_type_groups)
 
         for option_text in permit_types:
             category = type_to_category.get(option_text, "Unknown")
             print(f"[{category}] Selecting permit type in new tab: {option_text}")
             tab_page = await self.open_residential_option_tab(page, url, option_text)
             try:
-                await self.after_residential_selection(tab_page, url, option_text)
+                await self.after_residential_selection(tab_page, url, option_text, category)
             finally:
                 await tab_page.close()
 
-    def get_target_permit_types(self) -> list[str]:
-        """Return a flat ordered list of all permit type labels from PERMIT_TYPE_GROUPS.
+    def get_permit_type_groups(self, url: str) -> dict[str, list[str]]:
+        county_key = self.get_county_key(url)
+        if not county_key:
+            raise ValueError(f"SmartGov URL is not configured in SMARTGOV_URLS: {url}")
+        if county_key not in COUNTY_PERMIT_TYPE_GROUPS:
+            raise ValueError(
+                f"No SmartGov permit type groups configured for county key: {county_key}"
+            )
+        return COUNTY_PERMIT_TYPE_GROUPS[county_key]
+
+    def get_county_key(self, url: str) -> str | None:
+        for county_key, county_config in SMARTGOV_URLS.items():
+            if county_config.get("search_url") == url:
+                return county_key
+        return None
+
+    def get_target_permit_types(self, permit_type_groups: dict[str, list[str]]) -> list[str]:
+        """Return a flat ordered list of all permit type labels from configured groups.
 
         The list preserves the category order and the within-category order defined
         in constants.py.  Each label will be selected one-by-one in the Type dropdown.
         """
-        return [
-            permit_type
-            for types in PERMIT_TYPE_GROUPS.values()
-            for permit_type in types
-        ]
+        permit_types: list[str] = []
+        seen: set[str] = set()
+        for types in permit_type_groups.values():
+            for permit_type in types:
+                if permit_type in seen:
+                    continue
+                permit_types.append(permit_type)
+                seen.add(permit_type)
+        return permit_types
 
-    async def validate_permit_type_on_page(self, page: Any) -> list[str]:
+    def get_type_to_category(self, permit_type_groups: dict[str, list[str]]) -> dict[str, str]:
+        type_to_categories: dict[str, list[str]] = {}
+        for category, permit_types in permit_type_groups.items():
+            for permit_type in permit_types:
+                type_to_categories.setdefault(permit_type, []).append(category)
+        return {
+            permit_type: "; ".join(categories)
+            for permit_type, categories in type_to_categories.items()
+        }
+
+    async def validate_permit_type_on_page(
+        self,
+        page: Any,
+        permit_type_groups: dict[str, list[str]] | None = None,
+    ) -> list[str]:
         """Return the subset of target permit types that actually exist in the dropdown.
 
         Useful for debugging when a county's dropdown does not have all expected options.
@@ -97,7 +147,9 @@ class SmartGovPlaywrightWorkflow:
         dropdown = page.locator(self.permit_type_selector)
         all_options = await dropdown.locator("option").all_inner_texts()
         available = {opt.strip() for opt in all_options if opt.strip()}
-        target = self.get_target_permit_types()
+        if permit_type_groups is None:
+            raise ValueError("permit_type_groups is required for SmartGov validation")
+        target = self.get_target_permit_types(permit_type_groups)
         missing = [t for t in target if t not in available]
         if missing:
             print(f"WARNING: The following permit types were NOT found in dropdown: {missing}")
@@ -108,15 +160,21 @@ class SmartGovPlaywrightWorkflow:
         tab_page = await page.context.new_page()
         await self.goto_search_page(tab_page, url)
 
-        dropdown = tab_page.locator(self.permit_type_selector)
+        dropdown = await self.find_type_dropdown(tab_page)
         await dropdown.select_option(label=option_text)
-        await self.wait_for_postback_settle(tab_page, self.permit_type_selector)
+        await self.wait_for_postback_settle(tab_page)
         await self.apply_date_range(tab_page)
         return tab_page
 
-    async def after_residential_selection(self, page: Any, url: str, option_text: str) -> None:
+    async def after_residential_selection(
+        self,
+        page: Any,
+        url: str,
+        option_text: str,
+        category: str,
+    ) -> None:
         await self.click_search(page)
-        await self.collect_paginated_results(page, url, option_text)
+        await self.collect_paginated_results(page, url, option_text, category)
         # Write the next step for each selected option here.
         # Example steps:
         # - verify the selected value stayed selected after postback
@@ -139,10 +197,16 @@ class SmartGovPlaywrightWorkflow:
         print(f"Setting date range from: {start_date_str} to: {current_date_str}")
 
         start_date_input = page.locator(self.start_date_selector)
+        if await start_date_input.count() == 0:
+            print("Date range inputs not found on SmartGov form; continuing without date filter.")
+            return
         await start_date_input.fill("")
         await start_date_input.type(start_date_str)
 
         end_date_input = page.locator(self.end_date_selector)
+        if await end_date_input.count() == 0:
+            await start_date_input.press("Tab")
+            return
         await end_date_input.fill("")
         await end_date_input.type(current_date_str)
         await end_date_input.press("Tab")
@@ -155,29 +219,23 @@ class SmartGovPlaywrightWorkflow:
                 wait_until="domcontentloaded",
                 timeout=BROWSER_POSTBACK_TIMEOUT_MS,
             ):
-                await page.locator(self.search_button_selector).click()
+                await self.click_search_button(page)
         except PlaywrightTimeoutError:
             print("Primary navigation timed out. Attempting fallback strategy...")
 
-            await page.locator(self.search_button_selector).click(force=True)
+            await self.click_search_button(page, force=True)
             await page.wait_for_load_state(
                 "domcontentloaded",
                 timeout=BROWSER_POSTBACK_TIMEOUT_MS,
             )
 
             try:
-                await page.wait_for_selector(
-                    self.results_page_element_indicator,
-                    timeout=BROWSER_RESULTS_TIMEOUT_MS,
-                )
+                await self.wait_for_results_page(page)
             except PlaywrightTimeoutError:
                 print("Fallback failed: Results element did not appear. Page might be stuck.")
                 raise
         else:
-            await page.wait_for_selector(
-                self.results_page_element_indicator,
-                timeout=BROWSER_RESULTS_TIMEOUT_MS,
-            )
+            await self.wait_for_results_page(page)
 
         await self.print_search_result_snapshot(page)
 
@@ -191,50 +249,78 @@ class SmartGovPlaywrightWorkflow:
         print(f"Search result title: {title}")
         print(f"Search result preview:\n{body_preview}")
 
-    async def collect_paginated_results(self, page: Any, url: str, option_text: str) -> None:
+    async def collect_paginated_results(
+        self,
+        page: Any,
+        url: str,
+        option_text: str,
+        category: str,
+    ) -> None:
         await self.wait_for_results_page(page)
-        self.result_pages_html.append(await page.content())
-
-        processed_pages = {1}
+        current_page_num = 1
+        processed_pages: set[int] = set()
 
         while True:
-            batch_pages = await self.get_visible_page_numbers(page, processed_pages)
-            if not batch_pages:
-                if not await self.advance_pagination_window(page, processed_pages):
-                    break
-                batch_pages = await self.get_visible_page_numbers(page, processed_pages)
-                if not batch_pages:
-                    break
+            print(f"[{category}] Capturing {option_text} results page {current_page_num}...")
+            await self.capture_result_page(page, url, option_text, category, current_page_num)
+            processed_pages.add(current_page_num)
 
-            print(f"Processing page batch {batch_pages[0]} to {batch_pages[-1]} concurrently...")
-            print(f"Using up to {MAX_CONCURRENT_PAGES} concurrent page workers...")
-            processed_pages.update(batch_pages)
-            tasks = [
-                self.fetch_target_results_page(page.context, url, option_text, page_num)
-                for page_num in batch_pages
-            ]
-            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            for page_num, batch_result in zip(batch_pages, batch_results, strict=False):
-                if isinstance(batch_result, Exception):
-                    print(f"Failed to fetch Page {page_num}: {batch_result}")
-                    continue
-                if batch_result:
-                    self.result_pages_html.append(batch_result)
-
-            if not await self.advance_pagination_window(page, processed_pages):
+            next_page_num = await self.click_next_unprocessed_results_page(
+                page,
+                processed_pages,
+                current_page_num,
+            )
+            if next_page_num is None:
                 break
+            current_page_num = next_page_num
+
+        print(
+            f"[{category}] Finished {option_text}: processed result pages "
+            f"{sorted(processed_pages)}"
+        )
+
+    async def click_next_unprocessed_results_page(
+        self,
+        page: Any,
+        processed_pages: set[int],
+        current_page_num: int,
+    ) -> int | None:
+        visible_pages = await self.get_visible_page_numbers(page, processed_pages)
+        if visible_pages:
+            next_page_num = visible_pages[0]
+            if await self.click_page_number_if_visible(page, next_page_num):
+                return next_page_num
+
+        if await self.click_next_pagination_control(page):
+            await self.wait_for_results_page(page)
+            return current_page_num + 1
+
+        for more_text in self.pagination_more_texts:
+            if await self.click_special_pagination_control(page, more_text):
+                new_visible_pages = await self.get_visible_page_numbers(page, processed_pages)
+                if new_visible_pages:
+                    next_page_num = new_visible_pages[0]
+                    if await self.click_page_number_if_visible(page, next_page_num):
+                        return next_page_num
+
+        return None
 
     async def get_visible_page_numbers(self, page: Any, processed_pages: set[int]) -> list[int]:
-        page_links = page.locator(self.pagination_link_selector)
         visible_pages: list[int] = []
 
-        for index in range(await page_links.count()):
-            link_text = (await page_links.nth(index).inner_text()).strip()
-            if link_text.isdigit():
-                page_num = int(link_text)
-                if page_num not in processed_pages:
-                    visible_pages.append(page_num)
+        for selector in (self.pagination_link_selector, "a"):
+            page_links = page.locator(selector)
+            for index in range(await page_links.count()):
+                link = page_links.nth(index)
+                if not await link.is_visible():
+                    continue
+                link_text = (await link.inner_text()).strip()
+                if link_text.isdigit():
+                    page_num = int(link_text)
+                    if page_num not in processed_pages:
+                        visible_pages.append(page_num)
+            if visible_pages:
+                break
 
         return sorted(set(visible_pages))
 
@@ -245,16 +331,17 @@ class SmartGovPlaywrightWorkflow:
             if new_visible_pages:
                 return True
 
-        if await self.click_special_pagination_control(page, self.pagination_more_text):
-            new_visible_pages = await self.get_visible_page_numbers(page, processed_pages)
-            if new_visible_pages:
-                return True
+        for more_text in self.pagination_more_texts:
+            if await self.click_special_pagination_control(page, more_text):
+                new_visible_pages = await self.get_visible_page_numbers(page, processed_pages)
+                if new_visible_pages:
+                    return True
 
         pagination_cells = page.locator(self.pagination_cell_selector)
         for index in range(await pagination_cells.count()):
             cell = pagination_cells.nth(index)
             cell_text = (await cell.inner_text()).strip()
-            if self.pagination_next_text not in cell_text:
+            if not any(next_text in cell_text for next_text in self.pagination_next_texts):
                 continue
 
             next_link = cell.locator("a")
@@ -266,16 +353,22 @@ class SmartGovPlaywrightWorkflow:
             if new_visible_pages:
                 return True
 
+        if await self.click_next_pagination_control(page):
+            new_visible_pages = await self.get_visible_page_numbers(page, processed_pages)
+            if new_visible_pages:
+                return True
+
         return False
 
     async def click_page_number_if_visible(self, page: Any, target_page_num: int) -> bool:
-        page_links = page.locator(self.pagination_link_selector)
-        for index in range(await page_links.count()):
-            link = page_links.nth(index)
-            link_text = (await link.inner_text()).strip()
-            if link_text == str(target_page_num) and await link.is_visible():
-                await self.click_and_wait_for_results(page, link)
-                return True
+        for selector in (self.pagination_link_selector, "a"):
+            page_links = page.locator(selector)
+            for index in range(await page_links.count()):
+                link = page_links.nth(index)
+                link_text = (await link.inner_text()).strip()
+                if link_text == str(target_page_num) and await link.is_visible():
+                    await self.click_and_wait_for_results(page, link)
+                    return True
         return False
 
     async def fetch_target_results_page(
@@ -283,8 +376,9 @@ class SmartGovPlaywrightWorkflow:
         context: Any,
         url: str,
         option_text: str,
+        category: str,
         target_page_num: int,
-    ) -> str | None:
+    ) -> tuple[str, list[dict[str, Any]]] | None:
         async with self.page_semaphore:
             last_error: Exception | None = None
             for attempt in range(1, WORKER_PAGE_NAVIGATION_RETRIES + 1):
@@ -293,9 +387,9 @@ class SmartGovPlaywrightWorkflow:
                     print(f"Opening worker for Page {target_page_num} (attempt {attempt})...")
                     await self.goto_search_page(worker_page, url)
 
-                    dropdown = worker_page.locator(self.permit_type_selector)
+                    dropdown = await self.find_type_dropdown(worker_page)
                     await dropdown.select_option(label=option_text)
-                    await self.wait_for_postback_settle(worker_page, self.permit_type_selector)
+                    await self.wait_for_postback_settle(worker_page)
                     await self.apply_date_range(worker_page)
                     await self.click_search(worker_page)
 
@@ -303,7 +397,13 @@ class SmartGovPlaywrightWorkflow:
                         print(f"Could not reach Page {target_page_num}.")
                         return None
 
-                    return await worker_page.content()
+                    return await self.capture_result_page(
+                        worker_page,
+                        url,
+                        option_text,
+                        category,
+                        target_page_num,
+                    )
                 except PlaywrightTimeoutError as exc:
                     last_error = exc
                     print(
@@ -318,26 +418,28 @@ class SmartGovPlaywrightWorkflow:
 
     async def go_to_results_page(self, page: Any, current_page_num: int) -> bool:
         while True:
-            page_links = page.locator(self.pagination_link_selector)
-            for index in range(await page_links.count()):
-                link = page_links.nth(index)
-                link_text = (await link.inner_text()).strip()
-                if link_text == str(current_page_num) and await link.is_visible():
-                    await self.click_and_wait_for_results(page, link)
-                    return True
+            for selector in (self.pagination_link_selector, "a"):
+                page_links = page.locator(selector)
+                for index in range(await page_links.count()):
+                    link = page_links.nth(index)
+                    link_text = (await link.inner_text()).strip()
+                    if link_text == str(current_page_num) and await link.is_visible():
+                        await self.click_and_wait_for_results(page, link)
+                        return True
 
             if not await self.advance_results_window_once(page):
                 return False
 
     async def advance_results_window_once(self, page: Any) -> bool:
-        if await self.click_special_pagination_control(page, self.pagination_more_text):
-            return True
+        for more_text in self.pagination_more_texts:
+            if await self.click_special_pagination_control(page, more_text):
+                return True
 
         pagination_cells = page.locator(self.pagination_cell_selector)
         for index in range(await pagination_cells.count()):
             cell = pagination_cells.nth(index)
             cell_text = (await cell.inner_text()).strip()
-            if self.pagination_next_text not in cell_text:
+            if not any(next_text in cell_text for next_text in self.pagination_next_texts):
                 continue
 
             next_link = cell.locator("a")
@@ -347,16 +449,40 @@ class SmartGovPlaywrightWorkflow:
             await self.click_and_wait_for_results(page, next_link.first)
             return True
 
+        if await self.click_next_pagination_control(page):
+            return True
+
         return False
 
     async def click_special_pagination_control(self, page: Any, control_text: str) -> bool:
-        page_links = page.locator(self.pagination_link_selector)
-        for index in range(await page_links.count()):
-            link = page_links.nth(index)
-            link_text = (await link.inner_text()).strip()
-            if link_text == control_text and await link.is_visible():
-                await self.click_and_wait_for_results(page, link)
-                return True
+        for selector in (self.pagination_link_selector, "a"):
+            page_links = page.locator(selector)
+            for index in range(await page_links.count()):
+                link = page_links.nth(index)
+                link_text = (await link.inner_text()).strip()
+                if link_text == control_text and await link.is_visible():
+                    await self.click_and_wait_for_results(page, link)
+                    return True
+        return False
+
+    async def click_next_pagination_control(self, page: Any) -> bool:
+        for selector in (self.pagination_link_selector, "a"):
+            page_links = page.locator(selector)
+            for index in range(await page_links.count()):
+                link = page_links.nth(index)
+                if not await link.is_visible():
+                    continue
+                link_text = (await link.inner_text()).strip()
+                aria_label = (await link.get_attribute("aria-label") or "").strip()
+                title = (await link.get_attribute("title") or "").strip()
+                candidates = {link_text, aria_label, title}
+                if any(
+                    next_text == candidate or next_text in candidate
+                    for candidate in candidates
+                    for next_text in self.pagination_next_texts
+                ):
+                    await self.click_and_wait_for_results(page, link)
+                    return True
         return False
 
     async def click_and_wait_for_results(self, page: Any, locator: Any) -> None:
@@ -367,11 +493,13 @@ class SmartGovPlaywrightWorkflow:
             ):
                 await locator.click()
         except PlaywrightTimeoutError:
-            await locator.click(force=True)
-            await page.wait_for_load_state(
-                "domcontentloaded",
-                timeout=BROWSER_POSTBACK_TIMEOUT_MS,
-            )
+            try:
+                await page.wait_for_load_state(
+                    "domcontentloaded",
+                    timeout=BROWSER_POSTBACK_TIMEOUT_MS,
+                )
+            except PlaywrightTimeoutError:
+                pass
 
         await self.wait_for_results_page(page)
 
@@ -381,24 +509,281 @@ class SmartGovPlaywrightWorkflow:
             wait_until="domcontentloaded",
             timeout=BROWSER_NAVIGATION_TIMEOUT_MS,
         )
-        await page.wait_for_selector(
-            self.permit_type_selector,
-            timeout=BROWSER_NAVIGATION_TIMEOUT_MS,
-        )
+        await self.find_type_dropdown(page, timeout=BROWSER_NAVIGATION_TIMEOUT_MS)
 
-    async def wait_for_postback_settle(self, page: Any, selector: str) -> None:
+    async def wait_for_postback_settle(self, page: Any, selector: str | None = None) -> None:
         try:
             await page.wait_for_load_state("networkidle", timeout=5000)
         except PlaywrightTimeoutError:
             pass
-        await page.wait_for_selector(selector, timeout=BROWSER_POSTBACK_TIMEOUT_MS)
+        if selector:
+            await page.wait_for_selector(selector, timeout=BROWSER_POSTBACK_TIMEOUT_MS)
+        else:
+            await self.find_type_dropdown(page, timeout=BROWSER_POSTBACK_TIMEOUT_MS)
 
     async def wait_for_results_page(self, page: Any) -> None:
         try:
             await page.wait_for_load_state("networkidle", timeout=5000)
         except PlaywrightTimeoutError:
             pass
+
+        record_link = page.get_by_role("link", name=self.smartgov_record_link_pattern).first
+        try:
+            await record_link.wait_for(state="visible", timeout=BROWSER_RESULTS_TIMEOUT_MS)
+            return
+        except PlaywrightTimeoutError:
+            pass
+
+        try:
+            await page.wait_for_function(
+                """() => /\\b\\d+\\s+results\\b/i.test(document.body.innerText)""",
+                timeout=3000,
+            )
+            return
+        except PlaywrightTimeoutError:
+            pass
+
         await page.wait_for_selector(
             self.results_page_element_indicator,
+            timeout=3000,
+        )
+
+    async def capture_result_page(
+        self,
+        page: Any,
+        url: str,
+        option_text: str,
+        category: str,
+        page_num: int = 1,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        html = await page.content()
+        self.result_pages_html.append(html)
+        records = parse_rows(BeautifulSoup(html, "html.parser"), url)
+        if not records:
+            raise RuntimeError(
+                f"No SmartGov records parsed for {option_text} page {page_num}; stopping this permit type."
+            )
+        records = [
+            {
+                **record,
+                "application_group": category,
+                "application_type": option_text,
+            }
+            for record in records
+        ]
+        records = await self.enrich_records_with_details(page, records, url, option_text, page_num)
+        if records:
+            self.result_record_batches.append(records)
+            if self.result_batch_callback is not None:
+                self.result_batch_callback(records)
+        return html, records
+
+    async def enrich_records_with_details(
+        self,
+        page: Any,
+        records: list[dict[str, Any]],
+        url: str,
+        option_text: str,
+        page_num: int,
+    ) -> list[dict[str, Any]]:
+        if not records:
+            return []
+
+        enriched_records: list[dict[str, Any]] = []
+        for record in records:
+            try:
+                detail_result = await self.fetch_detail_fields(
+                    page,
+                    record,
+                    url,
+                    option_text,
+                    page_num,
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"Failed to fetch detail for {record.get('record_number')}: {exc}")
+                raise
+            enriched_records.append(merge_detail_fields(record, detail_result or {}))
+        return enriched_records
+
+    async def fetch_detail_fields(
+        self,
+        page: Any,
+        record: dict[str, Any],
+        url: str,
+        option_text: str,
+        page_num: int,
+    ) -> dict[str, Any]:
+        detail_link = record.get("detail_link")
+
+        async with self.detail_page_semaphore:
+            if detail_link:
+                detail_page = await page.context.new_page()
+                try:
+                    await detail_page.goto(
+                        detail_link,
+                        wait_until="domcontentloaded",
+                        timeout=BROWSER_NAVIGATION_TIMEOUT_MS,
+                    )
+                    return await self.parse_open_detail_page(detail_page)
+                finally:
+                    await detail_page.close()
+
+            return await self.fetch_detail_fields_by_click(
+                page,
+                record,
+                url,
+                option_text,
+                page_num,
+            )
+
+    async def fetch_detail_fields_by_click(
+        self,
+        page: Any,
+        record: dict[str, Any],
+        url: str,
+        option_text: str,
+        page_num: int,
+    ) -> dict[str, Any]:
+        record_number = record.get("record_number")
+        if not record_number:
+            return {}
+
+        detail_page = await page.context.new_page()
+        try:
+            await self.goto_search_page(detail_page, url)
+            dropdown = await self.find_type_dropdown(detail_page)
+            await dropdown.select_option(label=option_text)
+            await self.wait_for_postback_settle(detail_page)
+            await self.apply_date_range(detail_page)
+            await self.click_search(detail_page)
+            if page_num > 1 and not await self.go_to_results_page(detail_page, page_num):
+                raise RuntimeError(f"Could not return detail worker to results page {page_num}")
+
+            link = detail_page.get_by_role("link", name=str(record_number), exact=True).first
+            if await link.count() == 0:
+                link = detail_page.locator("a").filter(has_text=str(record_number)).first
+            if await link.count() == 0 or not await link.is_visible():
+                raise RuntimeError(f"Could not find detail link for {record_number}")
+
+            try:
+                async with detail_page.expect_navigation(
+                    wait_until="domcontentloaded",
+                    timeout=BROWSER_NAVIGATION_TIMEOUT_MS,
+                ):
+                    await link.click()
+            except PlaywrightTimeoutError:
+                pass
+
+            await self.wait_for_detail_page(detail_page, record_number)
+            return await self.parse_open_detail_page(detail_page)
+        finally:
+            await detail_page.close()
+
+    async def parse_open_detail_page(self, page: Any) -> dict[str, Any]:
+        try:
+            await page.wait_for_load_state("networkidle", timeout=5000)
+        except PlaywrightTimeoutError:
+            pass
+        await self.expand_detail_sections(page)
+        return parse_detail_fields(BeautifulSoup(await page.content(), "html.parser"))
+
+    async def wait_for_detail_page(self, page: Any, record_number: str) -> None:
+        try:
+            await page.wait_for_url(
+                "**/PermittingPublic/PermitLandingPagePublic/**",
+                timeout=BROWSER_NAVIGATION_TIMEOUT_MS,
+            )
+            return
+        except PlaywrightTimeoutError:
+            pass
+
+        await page.wait_for_function(
+            """() => {
+                const text = document.body ? document.body.innerText : "";
+                return text.includes("Project Information")
+                    || text.includes("Current Fees")
+                    || text.includes("Reference Number");
+            }""",
             timeout=BROWSER_RESULTS_TIMEOUT_MS,
         )
+
+    async def expand_detail_sections(self, page: Any) -> None:
+        section_names = (
+            "Contacts",
+            "Details",
+            "Parcels",
+            "Inspections",
+            "Fees",
+        )
+        for section_name in section_names:
+            locators = [
+                page.get_by_text(section_name, exact=True),
+                page.locator(f"text={section_name}"),
+            ]
+            for locator in locators:
+                count = await locator.count()
+                for index in range(count):
+                    section_toggle = locator.nth(index)
+                    if not await section_toggle.is_visible():
+                        continue
+                    try:
+                        should_click = await section_toggle.evaluate(
+                            """element => {
+                                const clickable = element.closest("button,a,[role='button']") || element;
+                                const expanded = clickable.getAttribute("aria-expanded");
+                                if (expanded === "false") return true;
+                                if (expanded === "true") return false;
+                                const parent = element.parentElement;
+                                return parent ? parent.innerText.trim().length < 120 : true;
+                            }"""
+                        )
+                        if not should_click:
+                            continue
+                        await section_toggle.click(timeout=1500)
+                        await page.wait_for_timeout(250)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    break
+
+        try:
+            await page.wait_for_load_state("networkidle", timeout=3000)
+        except PlaywrightTimeoutError:
+            pass
+
+    async def find_type_dropdown(self, page: Any, timeout: int = BROWSER_POSTBACK_TIMEOUT_MS) -> Any:
+        await page.wait_for_selector("select", timeout=timeout)
+        selectors = [
+            self.permit_type_selector,
+            "select[name*='Type']",
+            "select[id*='Type']",
+            "xpath=//label[contains(normalize-space(.), 'Type')]/following::select[1]",
+            "xpath=//*[contains(normalize-space(.), 'Type')]/following::select[1]",
+        ]
+        for selector in selectors:
+            locator = page.locator(selector).first
+            if await locator.count() == 0:
+                continue
+            if await locator.is_visible():
+                return locator
+
+        first_select = page.locator("select").first
+        if await first_select.count() > 0 and await first_select.is_visible():
+            return first_select
+        raise PlaywrightTimeoutError("Could not find SmartGov Type dropdown")
+
+    async def click_search_button(self, page: Any, force: bool = False) -> None:
+        locators = [
+            page.locator(self.search_button_selector),
+            page.get_by_role("button", name="Search"),
+            page.locator("input[type='submit'][value='Search']"),
+            page.locator("button:has-text('Search')"),
+        ]
+        for locator in locators:
+            if await locator.count() == 0:
+                continue
+            button = locator.first
+            if not await button.is_visible():
+                continue
+            await button.click(force=force)
+            return
+        raise PlaywrightTimeoutError("Could not find SmartGov Search button")

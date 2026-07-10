@@ -1,19 +1,148 @@
 from __future__ import annotations
 
 import argparse
+import queue
+import threading
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 from adapters.accela.constants import URLS as ACCELA_URLS
 from adapters.accela.adapter import AccelaAdapter
 from adapters.base.base_adapter import BaseAdapter
 from adapters.detector import AdapterDetector, build_adapters
-from adapters.smartgov.constants import SMARTGOV_URLS
+from adapters.smartgov.constants import SMARTGOV_URLS, STATE_NAMES
 from adapters.smartgov.adapter import SmartGovAdapter
 from db.mongo_client import MongoStore
 from utils.logger import get_logger
 
 logger = get_logger("crawler")
+
+
+def save_raw_batches(
+    store: MongoStore,
+    *,
+    raw_batches: list[list[dict[str, Any]]],
+    source_metadata: dict[str, str | None],
+    source_url: str,
+    selected_adapter: BaseAdapter,
+    is_smartgov: bool,
+) -> int:
+    saved_records = 0
+    for raw_batch in raw_batches:
+        if not raw_batch:
+            continue
+
+        store.save_raw_result_batch(
+            county_name=source_metadata["county_name"],
+            state_name=source_metadata["state_name"],
+            agency_key=source_metadata["agency_key"],
+            module_name=source_metadata["module_name"],
+            source_url=source_url,
+            adapter_name=selected_adapter.name,
+            raw_items=raw_batch,
+        )
+
+        for raw in raw_batch:
+            normalized = selected_adapter.normalize(raw)
+            store.save_permit(
+                county_name=source_metadata["county_name"],
+                state_name=source_metadata["state_name"],
+                agency_key=source_metadata["agency_key"],
+                module_name=source_metadata["module_name"],
+                source_url=source_url,
+                adapter_name=selected_adapter.name,
+                normalized_data=normalized,
+                raw_data=raw,
+                crawl_status="success",
+            )
+            if is_smartgov:
+                store.save_resource_permit(
+                    state_name=source_metadata["state_name"],
+                    county_name=source_metadata["county_name"],
+                    resource_name=selected_adapter.name,
+                    source_url=source_url,
+                    normalized_data=normalized,
+                    raw_data=raw,
+                    crawl_status="success",
+                )
+            saved_records += 1
+    return saved_records
+
+
+class BackgroundBatchWriter:
+    def __init__(
+        self,
+        store: MongoStore,
+        *,
+        source_metadata: dict[str, str | None],
+        source_url: str,
+        selected_adapter: BaseAdapter,
+        is_smartgov: bool,
+    ) -> None:
+        self.store = store
+        self.source_metadata = source_metadata
+        self.source_url = source_url
+        self.selected_adapter = selected_adapter
+        self.is_smartgov = is_smartgov
+        self.saved_records = 0
+        self._queue: queue.Queue[list[dict[str, Any]] | None] = queue.Queue()
+        self._error: BaseException | None = None
+        self._closed = False
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"db-writer-{selected_adapter.name}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def enqueue(self, raw_batch: list[dict[str, Any]]) -> None:
+        self.raise_if_failed()
+        self._queue.put(list(raw_batch))
+        logger.info(
+            "Queued %s records for background DB save for %s",
+            len(raw_batch),
+            self.source_url,
+        )
+
+    def close(self, *, raise_errors: bool = True) -> None:
+        if not self._closed:
+            self._closed = True
+            self._queue.put(None)
+            self._thread.join()
+        if raise_errors:
+            self.raise_if_failed()
+
+    def raise_if_failed(self) -> None:
+        if self._error is not None:
+            raise RuntimeError("Background DB writer failed") from self._error
+
+    def _run(self) -> None:
+        while True:
+            raw_batch = self._queue.get()
+            try:
+                if raw_batch is None:
+                    return
+
+                saved_count = save_raw_batches(
+                    self.store,
+                    raw_batches=[raw_batch],
+                    source_metadata=self.source_metadata,
+                    source_url=self.source_url,
+                    selected_adapter=self.selected_adapter,
+                    is_smartgov=self.is_smartgov,
+                )
+                self.saved_records += saved_count
+                logger.info(
+                    "Saved SmartGov background batch with %s records for %s",
+                    saved_count,
+                    self.source_url,
+                )
+            except BaseException as exc:  # noqa: BLE001
+                self._error = exc
+                logger.exception("Background DB writer failed for %s", self.source_url)
+                return
+            finally:
+                self._queue.task_done()
 
 
 def load_urls_from_file(file_path: str | Path) -> list[str]:
@@ -60,12 +189,14 @@ def get_source_metadata(source_url: str) -> dict[str, str | None]:
                 return {
                     "agency_key": agency_key,
                     "county_name": agency_config.get("agency_name"),
+                    "state_name": None,
                     "module_name": module_name,
                 }
 
     return {
         "agency_key": None,
         "county_name": None,
+        "state_name": None,
         "module_name": None,
     }
 
@@ -87,14 +218,20 @@ def get_smartgov_source_metadata(source_url: str) -> dict[str, str | None]:
     """Return county metadata for a SmartGov search URL."""
     for county_key, county_config in SMARTGOV_URLS.items():
         if county_config.get("search_url") == source_url:
+            county_name = county_config.get("county_name")
+            if county_name and county_name.endswith(" County"):
+                county_name = county_name.removesuffix(" County")
+            state_code = county_config.get("state")
             return {
                 "agency_key": county_key,
-                "county_name": county_config.get("county_name"),
+                "county_name": county_name,
+                "state_name": STATE_NAMES.get(state_code, state_code),
                 "module_name": "smartgov",
             }
     return {
         "agency_key": None,
         "county_name": None,
+        "state_name": None,
         "module_name": None,
     }
 
@@ -126,6 +263,7 @@ def crawl(urls: Iterable[str], headed: bool = False) -> None:
             get_smartgov_source_metadata(source_url) if is_smartgov else get_source_metadata(source_url)
         )
         logger.info("Crawling %s", source_url)
+        background_writer: BackgroundBatchWriter | None = None
 
         try:
             if is_smartgov and smartgov_adapter:
@@ -134,14 +272,13 @@ def crawl(urls: Iterable[str], headed: bool = False) -> None:
                 bootstrap_adapter = accela_adapter
             else:
                 bootstrap_adapter = adapters[0]
-            html = bootstrap_adapter.fetch_html(source_url)
-            soup = bootstrap_adapter.parse(html)
 
-            selected_adapter = detector.detect(source_url, html, soup)
+            selected_adapter = bootstrap_adapter
             run_id = store.create_run(
                 source_url,
                 selected_adapter.name,
                 county_name=source_metadata["county_name"],
+                state_name=source_metadata["state_name"],
                 agency_key=source_metadata["agency_key"],
                 module_name=source_metadata["module_name"],
             )
@@ -149,6 +286,7 @@ def crawl(urls: Iterable[str], headed: bool = False) -> None:
                 source_url,
                 selected_adapter.name,
                 county_name=source_metadata["county_name"],
+                state_name=source_metadata["state_name"],
                 agency_key=source_metadata["agency_key"],
                 module_name=source_metadata["module_name"],
             )
@@ -159,10 +297,41 @@ def crawl(urls: Iterable[str], headed: bool = False) -> None:
                 {
                     "adapter": selected_adapter.name,
                     "county_name": source_metadata["county_name"],
+                    "state_name": source_metadata["state_name"],
                     "agency_key": source_metadata["agency_key"],
                     "module_name": source_metadata["module_name"],
                 },
             )
+
+            callback_saved_records = 0
+            smartgov_callback_enabled = is_smartgov and isinstance(selected_adapter, SmartGovAdapter)
+            if smartgov_callback_enabled:
+                background_writer = BackgroundBatchWriter(
+                    store,
+                    source_metadata=source_metadata,
+                    source_url=source_url,
+                    selected_adapter=selected_adapter,
+                    is_smartgov=True,
+                )
+
+                def save_smartgov_batch(raw_batch: list[dict[str, Any]]) -> None:
+                    if background_writer is None:
+                        raise RuntimeError("Background DB writer was not initialized")
+                    background_writer.enqueue(raw_batch)
+
+                smartgov_adapter.set_raw_batch_callback(save_smartgov_batch)
+
+            try:
+                html = bootstrap_adapter.fetch_html(source_url)
+            finally:
+                if smartgov_callback_enabled:
+                    smartgov_adapter.set_raw_batch_callback(None)
+
+            soup = bootstrap_adapter.parse(html)
+
+            detected_adapter = detector.detect(source_url, html, soup)
+            if detected_adapter.name != selected_adapter.name:
+                selected_adapter = detected_adapter
 
             raw_items = selected_adapter.extract(source_url, html, soup)
             raw_batches = (
@@ -170,40 +339,50 @@ def crawl(urls: Iterable[str], headed: bool = False) -> None:
                 if hasattr(selected_adapter, "get_raw_batches")
                 else [raw_items]
             )
+            total_raw_records = sum(len(batch) for batch in raw_batches)
+            logger.info(
+                "Saving %s records across %s batches for %s",
+                total_raw_records,
+                len(raw_batches),
+                source_url,
+            )
             if not raw_items:
                 store.log(run_id, "INFO", "No permits found", {})
 
-            for raw_batch in raw_batches:
-                if not raw_batch:
-                    continue
-
-                store.save_raw_result_batch(
-                    county_name=source_metadata["county_name"],
-                    agency_key=source_metadata["agency_key"],
-                    module_name=source_metadata["module_name"],
-                    source_url=source_url,
-                    adapter_name=selected_adapter.name,
-                    raw_items=raw_batch,
+            if smartgov_callback_enabled:
+                if background_writer is not None:
+                    background_writer.close()
+                    callback_saved_records = background_writer.saved_records
+                logger.info(
+                    "SmartGov records were saved by background writer: %s records for %s",
+                    callback_saved_records,
+                    source_url,
                 )
-
-                for raw in raw_batch:
-                    normalized = selected_adapter.normalize(raw)
-                    store.save_permit(
-                        county_name=source_metadata["county_name"],
-                        agency_key=source_metadata["agency_key"],
-                        module_name=source_metadata["module_name"],
-                        source_url=source_url,
-                        adapter_name=selected_adapter.name,
-                        normalized_data=normalized,
-                        raw_data=raw,
-                        crawl_status="success",
-                    )
+            else:
+                save_raw_batches(
+                    store,
+                    raw_batches=raw_batches,
+                    source_metadata=source_metadata,
+                    source_url=source_url,
+                    selected_adapter=selected_adapter,
+                    is_smartgov=is_smartgov,
+                )
 
             if run_id is not None:
                 store.complete_run(run_id, status="success")
             logger.info("Completed %s", source_url)
 
         except Exception as exc:  # noqa: BLE001
+            if background_writer is not None:
+                try:
+                    background_writer.close(raise_errors=False)
+                    logger.info(
+                        "Background writer flushed %s records before failure for %s",
+                        background_writer.saved_records,
+                        source_url,
+                    )
+                except Exception as writer_exc:  # noqa: BLE001
+                    logger.exception("Failed to close background writer: %s", writer_exc)
             logger.exception("Failed %s", source_url)
             if run_id is not None:
                 store.log(run_id, "ERROR", str(exc), {"url": source_url})

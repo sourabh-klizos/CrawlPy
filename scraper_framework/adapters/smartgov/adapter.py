@@ -1,5 +1,5 @@
 import asyncio
-from typing import Any
+from typing import Any, Callable
 
 from bs4 import BeautifulSoup
 
@@ -21,24 +21,39 @@ class SmartGovAdapter(BaseAdapter):
         super().__init__()
         self.headed = headed
         self.raw_batches: list[list[dict[str, Any]]] = []
+        self.raw_batch_callback: Callable[[list[dict[str, Any]]], None] | None = None
         self.workflow = SmartGovPlaywrightWorkflow(
             request_timeout_ms=self.client.request_timeout_seconds * 1000
         )
+
+    def set_raw_batch_callback(
+        self,
+        callback: Callable[[list[dict[str, Any]]], None] | None,
+    ) -> None:
+        self.raw_batch_callback = callback
+        self.workflow.result_batch_callback = callback
 
     def fetch_html(self, url: str) -> str:
         return asyncio.run(self._fetch_html_async(url))
 
     async def _fetch_html_async(self, url: str) -> str:
         self.raw_batches = []
+        self.workflow.result_batch_callback = self.raw_batch_callback
         async with self.client.build_async_playwright() as playwright:
-            browser = await playwright.chromium.launch(headless=not self.headed)
+            browser = await playwright.chromium.launch(
+                headless=not self.headed,
+                chromium_sandbox=False,
+                args=["--no-sandbox", "--disable-setuid-sandbox"],
+            )
             context = await self.client.build_async_browser_context(browser)
             page = await context.new_page()
             html = await self.workflow.run(page, url)
-            self.raw_batches = [
-                parse_rows(BeautifulSoup(page_html, "html.parser"), url)
-                for page_html in self.workflow.result_pages_html
-            ]
+            self.raw_batches = self.workflow.result_record_batches
+            if not self.raw_batches:
+                self.raw_batches = [
+                    parse_rows(BeautifulSoup(page_html, "html.parser"), url)
+                    for page_html in self.workflow.result_pages_html
+                ]
             await context.close()
             await browser.close()
             return html
@@ -63,4 +78,9 @@ class SmartGovAdapter(BaseAdapter):
         normalized["status"] = raw.get("status")
         normalized["address"] = raw.get("address")
         normalized["record_type"] = raw.get("record_type")
+        normalized["applicant"] = raw.get("applicant")
+        normalized["contractor"] = raw.get("contractor")
+        normalized["owner"] = raw.get("owner")
+        normalized["parcel"] = raw.get("parcel")
+        normalized["valuation"] = raw.get("valuation")
         return normalized

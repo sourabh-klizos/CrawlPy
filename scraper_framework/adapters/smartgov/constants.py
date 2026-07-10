@@ -1,5 +1,8 @@
 ADAPTER_NAME = "smartgov"
 SIGNATURES = ["smartgovcommunity"]
+STATE_NAMES = {
+    "NC": "North Carolina",
+}
 SEARCH_WINDOW_YEARS = 2
 MAX_CONCURRENT_PAGES = 4
 WORKER_PAGE_NAVIGATION_RETRIES = 2
@@ -40,20 +43,31 @@ SMARTGOV_URLS: dict[str, dict[str, str]] = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Permit type groups to select in the Type dropdown on the search form.
-# Keys are the category labels (informational / for logging).
-# Values are the exact option labels to select one-by-one in the dropdown.
-# ---------------------------------------------------------------------------
-PERMIT_TYPE_GROUPS: dict[str, list[str]] = {
-    "Building (Commercial)": [
-        "Commercial New Construction Permit",
-    ],
-    "Building (Residential)": [
-        "Residential Duplex or Townhouse Permit",
-        "Residential New Single Family Permit",
-    ],
-    "Manufactured & Mobile Homes": [
-        "Manufactured Home Permit",
-    ],
+# County-specific permit type groups. Every SmartGov county should define the
+# exact Type dropdown labels to search here.
+COUNTY_PERMIT_TYPE_GROUPS: dict[str, dict[str, list[str]]] = {
+    "alexander_county": {
+        "Building (Commercial)": [
+            "New Residential or Commercial",
+        ],
+        "Building (Residential)": [
+            "New Residential or Commercial",
+        ],
+        "Manufactured & Mobile Homes": [
+            "Manufactured Home Appearance Application",
+            "Manufactured Home Permit",
+        ],
+    },
+    "catawba_county": {
+        "Building (Commercial)": [
+            "Commercial New Construction Permit",
+        ],
+        "Building (Residential)": [
+            "Residential Duplex or Townhouse Permit",
+            "Residential New Single Family Permit",
+        ],
+        "Manufactured & Mobile Homes": [
+            "Manufactured Home Permit",
+        ],
+    },
 }
