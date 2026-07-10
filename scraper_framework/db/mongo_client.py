@@ -43,6 +43,7 @@ class MongoStore:
         self,
         source_url: str,
         adapter_name: str,
+        state_name: str | None = None,
         county_name: str | None = None,
         agency_key: str | None = None,
         module_name: str | None = None,
@@ -50,6 +51,7 @@ class MongoStore:
         payload = {
             "source_url": source_url,
             "adapter_name": adapter_name,
+            "state_name": state_name,
             "county_name": county_name,
             "agency_key": agency_key,
             "module_name": module_name,
@@ -88,6 +90,7 @@ class MongoStore:
         self,
         source_url: str,
         adapter_name: str,
+        state_name: str | None = None,
         county_name: str | None = None,
         agency_key: str | None = None,
         module_name: str | None = None,
@@ -98,6 +101,7 @@ class MongoStore:
                 "$set": {
                     "source_url": source_url,
                     "adapter_name": adapter_name,
+                    "state_name": state_name,
                     "county_name": county_name,
                     "agency_key": agency_key,
                     "module_name": module_name,
@@ -110,6 +114,7 @@ class MongoStore:
 
     def save_permit(
         self,
+        state_name: str | None,
         county_name: str | None,
         agency_key: str | None,
         module_name: str | None,
@@ -121,6 +126,7 @@ class MongoStore:
     ) -> None:
         self._collection("permits").insert_one(
             {
+                "state_name": state_name,
                 "county_name": county_name,
                 "agency_key": agency_key,
                 "module_name": module_name,
@@ -135,6 +141,7 @@ class MongoStore:
 
     def save_raw_result_batch(
         self,
+        state_name: str | None,
         county_name: str | None,
         agency_key: str | None,
         module_name: str | None,
@@ -144,6 +151,7 @@ class MongoStore:
     ) -> None:
         self._collection("raw_permit_batches").insert_one(
             {
+                "state_name": state_name,
                 "county_name": county_name,
                 "agency_key": agency_key,
                 "module_name": module_name,
