@@ -591,21 +591,41 @@ class SmartGovPlaywrightWorkflow:
         if not records:
             return []
 
-        enriched_records: list[dict[str, Any]] = []
-        for record in records:
-            try:
-                detail_result = await self.fetch_detail_fields(
-                    page,
-                    record,
-                    url,
-                    option_text,
-                    page_num,
-                )
-            except Exception as exc:  # noqa: BLE001
-                print(f"Failed to fetch detail for {record.get('record_number')}: {exc}")
-                raise
-            enriched_records.append(merge_detail_fields(record, detail_result or {}))
-        return enriched_records
+        tasks = [
+            asyncio.create_task(
+                self.enrich_record_with_detail(page, record, url, option_text, page_num)
+            )
+            for record in records
+        ]
+        try:
+            return await asyncio.gather(*tasks)
+        except Exception:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
+    async def enrich_record_with_detail(
+        self,
+        page: Any,
+        record: dict[str, Any],
+        url: str,
+        option_text: str,
+        page_num: int,
+    ) -> dict[str, Any]:
+        try:
+            detail_result = await self.fetch_detail_fields(
+                page,
+                record,
+                url,
+                option_text,
+                page_num,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"Failed to fetch detail for {record.get('record_number')}: {exc}")
+            raise
+        return merge_detail_fields(record, detail_result or {})
 
     async def fetch_detail_fields(
         self,
