@@ -7,14 +7,24 @@ from urllib.parse import urljoin
 
 import requests
 
-from config.settings import (
-    ADMIN_API_BASE_URL,
-    ADMIN_API_IMPORT_PATH,
-    ADMIN_API_TOKEN,
-    REQUEST_TIMEOUT_SECONDS,
-    USER_AGENT,
-)
-from utils.logger import get_logger
+try:
+    from config.settings import (
+        ADMIN_API_BASE_URL,
+        ADMIN_API_IMPORT_PATH,
+        ADMIN_API_TOKEN,
+        REQUEST_TIMEOUT_SECONDS,
+        USER_AGENT,
+    )
+    from utils.logger import get_logger
+except ModuleNotFoundError:
+    from scraper_framework.config.settings import (
+        ADMIN_API_BASE_URL,
+        ADMIN_API_IMPORT_PATH,
+        ADMIN_API_TOKEN,
+        REQUEST_TIMEOUT_SECONDS,
+        USER_AGENT,
+    )
+    from scraper_framework.utils.logger import get_logger
 
 
 logger = get_logger("admin_import")
@@ -46,14 +56,17 @@ class AdminPermitImportClient:
     token: str = ADMIN_API_TOKEN
     import_path: str = ADMIN_API_IMPORT_PATH
     timeout_seconds: int = REQUEST_TIMEOUT_SECONDS
-    session: requests.Session = field(default_factory=requests.Session)
+    user_agent: str = USER_AGENT
+    exclude_tmp: bool = True
+    exclude_statuses: list[str] = field(default_factory=lambda: ["Withdrawn"])
+    session: requests.Session = field(default_factory=requests.Session, repr=False)
 
     def __post_init__(self) -> None:
         self.session.headers.update(
             {
                 "Accept": "application/json",
                 "Content-Type": "application/json",
-                "User-Agent": USER_AGENT,
+                "User-Agent": self.user_agent,
             }
         )
         if self.token:
@@ -74,36 +87,67 @@ class AdminPermitImportClient:
         record = {
             "record_number": _coalesce(
                 normalized_data.get("record_number"),
+                normalized_data.get("permit_number"),
+                normalized_data.get("case_number"),
                 raw_data.get("record_number"),
+                raw_data.get("CaseNumber"),
+                raw_data.get("PermitNumber"),
+                raw_data.get("RecordNumber"),
             ),
             "permit_type": _coalesce(
                 normalized_data.get("permit_type"),
                 raw_data.get("permit_type"),
                 raw_data.get("record_type"),
                 normalized_data.get("record_type"),
+                raw_data.get("CaseType"),
+                raw_data.get("PermitType"),
+                raw_data.get("PermitTypeName"),
             ),
             "address": _coalesce(
                 normalized_data.get("address"),
                 raw_data.get("address"),
+                raw_data.get("AddressDisplay"),
+                raw_data.get("FullAddress"),
+                raw_data.get("SiteAddress"),
+                raw_data.get("LocationAddress"),
+                raw_data.get("Address", {}).get("FullAddress")
+                if isinstance(raw_data.get("Address"), dict)
+                else None,
             ),
             "status": _coalesce(
                 normalized_data.get("status"),
                 raw_data.get("status"),
+                raw_data.get("CaseStatus"),
+                raw_data.get("Status"),
             ),
             "date": _coalesce(
                 normalized_data.get("date"),
                 normalized_data.get("issue_date"),
+                normalized_data.get("issued_date"),
                 raw_data.get("date"),
                 raw_data.get("issue_date"),
+                raw_data.get("issued_date"),
+                raw_data.get("IssueDate"),
+                raw_data.get("IssuedDate"),
+                normalized_data.get("apply_date"),
+                normalized_data.get("applied_date"),
+                raw_data.get("apply_date"),
+                raw_data.get("applied_date"),
+                raw_data.get("ApplyDate"),
+                raw_data.get("AppliedDate"),
             ),
             "expiration_date": _coalesce(
                 normalized_data.get("expiration_date"),
                 raw_data.get("expiration_date"),
+                raw_data.get("ExpireDate"),
+                raw_data.get("ExpirationDate"),
             ),
             "description": _coalesce(
                 normalized_data.get("description"),
                 raw_data.get("description"),
                 raw_data.get("project_name"),
+                raw_data.get("ProjectName"),
+                raw_data.get("Description"),
             ),
             "raw": raw_data or dict(normalized_data),
         }
@@ -121,7 +165,7 @@ class AdminPermitImportClient:
         module: str | None = None,
         source_url: str | None = None,
         import_run_id: str | None = None,
-        exclude_tmp: bool = True,
+        exclude_tmp: bool | None = None,
         only_issued_active: bool | None = None,
         exclude_statuses: list[str] | None = None,
     ) -> dict[str, Any]:
@@ -134,9 +178,9 @@ class AdminPermitImportClient:
             "module": _strip_or_none(module),
             "source_url": _strip_or_none(source_url),
             "import_run_id": import_run_id or _utc_import_run_id(),
-            "exclude_tmp": exclude_tmp,
+            "exclude_tmp": self.exclude_tmp if exclude_tmp is None else exclude_tmp,
             "only_issued_active": only_issued_active,
-            "exclude_statuses": exclude_statuses or ["Withdrawn"],
+            "exclude_statuses": self.exclude_statuses if exclude_statuses is None else exclude_statuses,
             "records": records,
         }
         return {key: value for key, value in payload.items() if value is not None}
@@ -148,7 +192,7 @@ class AdminPermitImportClient:
         provider: str | None = None,
         fips: str | None = None,
         import_run_id: str | None = None,
-        exclude_tmp: bool = True,
+        exclude_tmp: bool | None = None,
         only_issued_active: bool | None = None,
         exclude_statuses: list[str] | None = None,
     ) -> dict[str, Any]:
@@ -177,8 +221,11 @@ class AdminPermitImportClient:
         county: str | None = None,
         provider: str | None = None,
         fips: str | None = None,
+        agency: str | None = None,
+        module: str | None = None,
+        source_url: str | None = None,
         import_run_id: str | None = None,
-        exclude_tmp: bool = True,
+        exclude_tmp: bool | None = None,
         only_issued_active: bool | None = None,
         exclude_statuses: list[str] | None = None,
     ) -> dict[str, Any]:
@@ -189,7 +236,7 @@ class AdminPermitImportClient:
         records = [
             self.build_record(
                 permit_document.get("normalized_data") or {},
-                raw_data=permit_document.get("raw_data"),
+                raw_data=permit_document.get("raw_data") or permit_document.get("raw"),
             )
             for permit_document in permit_documents
         ]
@@ -198,9 +245,9 @@ class AdminPermitImportClient:
             state=state or first_document.get("state_name") or "",
             county=county or first_document.get("county_name") or "",
             fips=fips,
-            agency=first_document.get("agency_key"),
-            module=first_document.get("module_name"),
-            source_url=first_document.get("source_url"),
+            agency=agency or first_document.get("agency_key"),
+            module=module or first_document.get("module_name"),
+            source_url=source_url or first_document.get("source_url"),
             import_run_id=import_run_id,
             exclude_tmp=exclude_tmp,
             only_issued_active=only_issued_active,

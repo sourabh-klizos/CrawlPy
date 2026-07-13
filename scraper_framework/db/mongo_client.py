@@ -6,6 +6,7 @@ from urllib.parse import quote_plus
 
 from pymongo import MongoClient
 from pymongo.collection import Collection
+from pymongo.cursor import Cursor
 
 try:
     from config.settings import (
@@ -48,6 +49,20 @@ class MongoStore:
 
     def _collection(self, name: str) -> Collection:
         return self.db[name]
+
+    def find_documents(
+        self,
+        collection_name: str,
+        query: dict[str, Any] | None = None,
+        sort: list[tuple[str, int]] | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        cursor: Cursor = self._collection(collection_name).find(query or {})
+        if sort:
+            cursor = cursor.sort(sort)
+        if limit is not None and limit > 0:
+            cursor = cursor.limit(limit)
+        return list(cursor)
 
     def insert_many_documents(self, collection_name: str, documents: list[dict[str, Any]]) -> int:
         if not documents:

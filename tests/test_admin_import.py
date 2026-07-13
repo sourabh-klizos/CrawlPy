@@ -5,9 +5,9 @@ from unittest.mock import Mock
 import pytest
 import requests
 
-sys.path.append(str(Path(__file__).resolve().parents[1] / "scraper_framework"))
+sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from admin_import import AdminPermitImportClient
+from scraper_framework.admin_import import AdminPermitImportClient
 
 
 def test_build_payload_from_mongo_batch_preserves_raw_items() -> None:
@@ -127,6 +127,74 @@ def test_build_record_prefers_raw_record_type_over_bad_normalized_record_type() 
     assert record["status"] == "Additional Information Requested"
     assert record["address"] == "1531 BOSTON RD"
 
+
+def test_build_payload_from_permit_documents_supports_tyler_fields_and_metadata() -> None:
+    client = AdminPermitImportClient(base_url="https://coverage.example.com", token="secret")
+
+    payload = client.build_payload_from_permit_documents(
+        [
+            {
+                "adapter_name": "tyler_energov",
+                "state_name": "North Carolina",
+                "county_name": "Person County",
+                "agency_key": "PERSON_COUNTY",
+                "module_name": "Permits",
+                "source_url": "https://personcountync-energovweb.tylerhost.net/apps/SelfService",
+                "normalized_data": {
+                    "permit_number": "BLDC-000108-2025",
+                    "permit_type": "Building New Construction (Commercial)",
+                    "status": "Issued",
+                    "address": "909 Stans Way Rougemont NC 27572",
+                    "issued_date": "2026-01-20T12:39:12",
+                    "applied_date": "2025-12-10T13:04:41",
+                },
+                "raw_data": {
+                    "CaseNumber": "BLDC-000108-2025",
+                    "CaseStatus": "Issued",
+                    "AddressDisplay": "909 Stans Way Rougemont NC 27572",
+                    "IssueDate": "2026-01-20T12:39:12",
+                },
+            }
+        ],
+        provider="tyler_energov",
+        state="North Carolina",
+        county="Person County",
+        agency="PERSON_COUNTY",
+        module="Permits",
+        source_url="https://personcountync-energovweb.tylerhost.net/apps/SelfService",
+        fips="37145",
+        import_run_id="run-123",
+    )
+
+    assert payload == {
+        "provider": "tyler_energov",
+        "state": "North Carolina",
+        "county": "Person County",
+        "fips": "37145",
+        "agency": "PERSON_COUNTY",
+        "module": "Permits",
+        "source_url": "https://personcountync-energovweb.tylerhost.net/apps/SelfService",
+        "import_run_id": "run-123",
+        "exclude_tmp": True,
+        "exclude_statuses": ["Withdrawn"],
+        "records": [
+            {
+                "record_number": "BLDC-000108-2025",
+                "permit_type": "Building New Construction (Commercial)",
+                "address": "909 Stans Way Rougemont NC 27572",
+                "status": "Issued",
+                "date": "2026-01-20T12:39:12",
+                "raw": {
+                    "CaseNumber": "BLDC-000108-2025",
+                    "CaseStatus": "Issued",
+                    "AddressDisplay": "909 Stans Way Rougemont NC 27572",
+                    "IssueDate": "2026-01-20T12:39:12",
+                },
+            }
+        ],
+    }
+
+
 def test_push_payload_posts_to_admin_import_endpoint() -> None:
     session = requests.Session()
     session.post = Mock()
@@ -172,7 +240,7 @@ def test_push_payload_logs_response_body(monkeypatch: pytest.MonkeyPatch) -> Non
         json=Mock(return_value={"job_id": "abc-123", "received": 1}),
     )
     log_info = Mock()
-    monkeypatch.setattr("admin_import.logger.info", log_info)
+    monkeypatch.setattr("scraper_framework.admin_import.logger.info", log_info)
 
     client = AdminPermitImportClient(
         base_url="https://coverage.example.com",
