@@ -5,7 +5,10 @@ from typing import Any
 
 import requests
 
-from config.settings import REQUEST_TIMEOUT_SECONDS, get_random_user_agent
+try:
+    from config.settings import REQUEST_TIMEOUT_SECONDS, get_random_user_agent
+except ModuleNotFoundError:
+    from scraper_framework.config.settings import REQUEST_TIMEOUT_SECONDS, get_random_user_agent
 
 
 @dataclass(slots=True)

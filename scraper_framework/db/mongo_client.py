@@ -7,14 +7,24 @@ from urllib.parse import quote_plus
 from pymongo import MongoClient
 from pymongo.collection import Collection
 
-from config.settings import (
-    MONGODB_DB,
-    MONGODB_HOST,
-    MONGODB_PARAMS,
-    MONGODB_PASSWORD,
-    MONGODB_SRV,
-    MONGODB_USERNAME,
-)
+try:
+    from config.settings import (
+        MONGODB_DB,
+        MONGODB_HOST,
+        MONGODB_PARAMS,
+        MONGODB_PASSWORD,
+        MONGODB_SRV,
+        MONGODB_USERNAME,
+    )
+except ModuleNotFoundError:
+    from scraper_framework.config.settings import (
+        MONGODB_DB,
+        MONGODB_HOST,
+        MONGODB_PARAMS,
+        MONGODB_PASSWORD,
+        MONGODB_SRV,
+        MONGODB_USERNAME,
+    )
 
 
 class MongoStore:
@@ -38,6 +48,13 @@ class MongoStore:
 
     def _collection(self, name: str) -> Collection:
         return self.db[name]
+
+    def insert_many_documents(self, collection_name: str, documents: list[dict[str, Any]]) -> int:
+        if not documents:
+            return 0
+
+        result = self._collection(collection_name).insert_many(documents)
+        return len(result.inserted_ids)
 
     def create_run(
         self,
