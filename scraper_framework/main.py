@@ -4,10 +4,12 @@ import argparse
 from pathlib import Path
 from typing import Iterable
 
+from bs4 import BeautifulSoup
+
 from adapters.accela.constants import URLS as ACCELA_URLS
-from adapters.accela.adapter import AccelaAdapter
 from adapters.base.base_adapter import BaseAdapter
 from adapters.detector import AdapterDetector, build_adapters
+from adapters.iworq_platform.constants import URLS as IWORQ_PLATFORM_URLS
 from db.mongo_client import MongoStore
 from utils.logger import get_logger
 
@@ -50,6 +52,21 @@ def load_accela_urls(agencies: Iterable[str] | None = None, modules: Iterable[st
     return selected_urls
 
 
+def load_iworq_platform_urls(agencies: Iterable[str] | None = None) -> list[str]:
+    agency_filter = {value.strip().upper() for value in (agencies or []) if value.strip()}
+    selected_urls: list[str] = []
+
+    for agency_key, agency_config in IWORQ_PLATFORM_URLS.items():
+        if agency_filter and agency_key.upper() not in agency_filter:
+            continue
+
+        url = agency_config.get("url")
+        if url:
+            selected_urls.append(url)
+
+    return selected_urls
+
+
 def get_source_metadata(source_url: str) -> dict[str, str | None]:
     for agency_key, agency_config in ACCELA_URLS.items():
         target_scrape_urls = agency_config.get("target_scrape_urls", {})
@@ -57,12 +74,23 @@ def get_source_metadata(source_url: str) -> dict[str, str | None]:
             if configured_url == source_url:
                 return {
                     "agency_key": agency_key,
+                    "state_name": agency_config.get("state_name") or agency_config.get("state"),
                     "county_name": agency_config.get("agency_name"),
                     "module_name": module_name,
                 }
 
+    for agency_key, agency_config in IWORQ_PLATFORM_URLS.items():
+        if agency_config.get("url") == source_url:
+            return {
+                "agency_key": agency_key,
+                "state_name": agency_config.get("state_name") or agency_config.get("state"),
+                "county_name": agency_config.get("county_name") or agency_config.get("agency_name"),
+                "module_name": None,
+            }
+
     return {
         "agency_key": None,
+        "state_name": None,
         "county_name": None,
         "module_name": None,
     }
@@ -74,11 +102,21 @@ def limit_urls(urls: list[str], limit: int | None = None) -> list[str]:
     return urls[:limit]
 
 
+def get_bootstrap_adapter(url: str, adapters: Iterable[BaseAdapter]) -> BaseAdapter:
+    empty_soup = BeautifulSoup("", "html.parser")
+    for adapter in adapters:
+        if adapter.name == "accela":
+            continue
+        if adapter.can_handle(url, "", empty_soup):
+            return adapter
+
+    return next(adapter for adapter in adapters if adapter.name == "accela")
+
+
 def crawl(urls: Iterable[str], headed: bool = False) -> None:
     adapters: list[BaseAdapter] = build_adapters()
-    accela_adapter = next((adapter for adapter in adapters if isinstance(adapter, AccelaAdapter)), None)
     for adapter in adapters:
-        if isinstance(adapter, AccelaAdapter):
+        if hasattr(adapter, "headed"):
             adapter.headed = headed
     detector = AdapterDetector(adapters)
     store = MongoStore()
@@ -93,7 +131,7 @@ def crawl(urls: Iterable[str], headed: bool = False) -> None:
         logger.info("Crawling %s", source_url)
 
         try:
-            bootstrap_adapter = accela_adapter if "accela" in source_url.lower() and accela_adapter else adapters[0]
+            bootstrap_adapter = get_bootstrap_adapter(source_url, adapters)
             html = bootstrap_adapter.fetch_html(source_url)
             soup = bootstrap_adapter.parse(html)
 
@@ -101,6 +139,7 @@ def crawl(urls: Iterable[str], headed: bool = False) -> None:
             run_id = store.create_run(
                 source_url,
                 selected_adapter.name,
+                state_name=source_metadata["state_name"],
                 county_name=source_metadata["county_name"],
                 agency_key=source_metadata["agency_key"],
                 module_name=source_metadata["module_name"],
@@ -108,6 +147,7 @@ def crawl(urls: Iterable[str], headed: bool = False) -> None:
             store.save_source(
                 source_url,
                 selected_adapter.name,
+                state_name=source_metadata["state_name"],
                 county_name=source_metadata["county_name"],
                 agency_key=source_metadata["agency_key"],
                 module_name=source_metadata["module_name"],
@@ -118,6 +158,7 @@ def crawl(urls: Iterable[str], headed: bool = False) -> None:
                 "Adapter selected",
                 {
                     "adapter": selected_adapter.name,
+                    "state_name": source_metadata["state_name"],
                     "county_name": source_metadata["county_name"],
                     "agency_key": source_metadata["agency_key"],
                     "module_name": source_metadata["module_name"],
@@ -138,6 +179,7 @@ def crawl(urls: Iterable[str], headed: bool = False) -> None:
                     continue
 
                 store.save_raw_result_batch(
+                    state_name=source_metadata["state_name"],
                     county_name=source_metadata["county_name"],
                     agency_key=source_metadata["agency_key"],
                     module_name=source_metadata["module_name"],
@@ -149,6 +191,7 @@ def crawl(urls: Iterable[str], headed: bool = False) -> None:
                 for raw in raw_batch:
                     normalized = selected_adapter.normalize(raw)
                     store.save_permit(
+                        state_name=source_metadata["state_name"],
                         county_name=source_metadata["county_name"],
                         agency_key=source_metadata["agency_key"],
                         module_name=source_metadata["module_name"],
@@ -176,9 +219,9 @@ def parse_args() -> argparse.Namespace:
     default_urls_file = Path(__file__).resolve().parent / "urls.txt"
     parser.add_argument(
         "--source",
-        choices=("accela_constants", "file"),
-        default="accela_constants",
-        help="Where to load URLs from. Defaults to the Accela URLS constant.",
+        choices=("accela_constants", "iworq_platform_constants", "file"),
+        default="iworq_platform_constants",
+        help="Where to load URLs from. Defaults to the iWorQ Platform URLS constant.",
     )
     parser.add_argument(
         "--url",
@@ -224,6 +267,8 @@ def main() -> None:
         target_urls = args.url
     elif args.source == "accela_constants":
         target_urls = load_accela_urls(args.agency, args.module)
+    elif args.source == "iworq_platform_constants":
+        target_urls = load_iworq_platform_urls(args.agency)
     else:
         target_urls = load_urls_from_file(args.urls)
 
