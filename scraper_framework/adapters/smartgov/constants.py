@@ -70,4 +70,16 @@ COUNTY_PERMIT_TYPE_GROUPS: dict[str, dict[str, list[str]]] = {
             "Manufactured Home Permit",
         ],
     },
+    "columbus_county": {
+        "Building (Commercial)": [
+            "Commercial Building Permit New Construction",
+        ],
+        "Building (Residential)": [
+            "Residential Building Permit (Existing Building)",
+            "Residential Building Permit (New Construction)",
+        ],
+        "Manufactured & Mobile Homes": [
+            "Manufactured Homes"
+        ]
+    },
 }
