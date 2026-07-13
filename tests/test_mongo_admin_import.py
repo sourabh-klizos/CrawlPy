@@ -25,7 +25,7 @@ def _args(**overrides: object) -> Namespace:
         "provider": None,
         "fips": None,
         "only_issued_active": False,
-        "limit": 1,
+        "limit": None,
         "dry_run": False,
         "print_payload": False,
     }
@@ -141,7 +141,7 @@ def test_run_import_returns_dry_run_summary_without_push() -> None:
     }
 
     fake_collection = Mock()
-    fake_collection.find.return_value.sort.return_value.limit.return_value = [permit_document]
+    fake_collection.find.return_value.sort.return_value = [permit_document]
     fake_store = SimpleNamespace(
         _collection=Mock(return_value=fake_collection),
         find_already_pushed=Mock(return_value=None),
@@ -184,7 +184,7 @@ def test_run_import_uses_cooper_city_state_override(monkeypatch: pytest.MonkeyPa
         },
     }
     fake_collection = Mock()
-    fake_collection.find.return_value.sort.return_value.limit.return_value = [permit_document]
+    fake_collection.find.return_value.sort.return_value = [permit_document]
     fake_store = SimpleNamespace(
         _collection=Mock(return_value=fake_collection),
         find_already_pushed=Mock(return_value=None),
@@ -247,7 +247,7 @@ def test_run_import_pushes_payload_when_not_dry_run(monkeypatch: pytest.MonkeyPa
         "raw_data": {"record_number": "BLD-2", "record_type": "Residential", "address": "456 Main St"},
     }
     fake_collection = Mock()
-    fake_collection.find.return_value.sort.return_value.limit.return_value = [permit_document]
+    fake_collection.find.return_value.sort.return_value = [permit_document]
     fake_store = SimpleNamespace(
         _collection=Mock(return_value=fake_collection),
         find_already_pushed=Mock(return_value=None),
@@ -336,7 +336,7 @@ def test_run_import_skips_permits_already_pushed(monkeypatch: pytest.MonkeyPatch
         "raw_data": {"record_number": "BLD-3", "record_type": "Residential", "address": "789 Main St"},
     }
     fake_collection = Mock()
-    fake_collection.find.return_value.sort.return_value.limit.return_value = [permit_document]
+    fake_collection.find.return_value.sort.return_value = [permit_document]
     fake_store = SimpleNamespace(
         _collection=Mock(return_value=fake_collection),
         find_already_pushed=Mock(return_value={"payload_hash": "existing-hash"}),

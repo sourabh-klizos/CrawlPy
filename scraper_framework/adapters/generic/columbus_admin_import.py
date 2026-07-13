@@ -10,33 +10,33 @@ if __package__ in {None, ""}:
 from adapters.accela.mongo_admin_import import run_import
 
 
-ALEXANDER_SOURCE_URL = (
-    "https://co-alexander-nc.smartgovcommunity.com/"
+COLUMBUS_SOURCE_URL = (
+    "https://co-columbus-nc.smartgovcommunity.com/"
     "ApplicationPublic/ApplicationSearchAdvanced/Search"
 )
-ALEXANDER_STATE = "North Carolina"
-ALEXANDER_COUNTY = "Alexander"
-ALEXANDER_PROVIDER = "smartgovcommunity"
+COLUMBUS_STATE = "North Carolina"
+COLUMBUS_COUNTY = "Columbus"
+COLUMBUS_PROVIDER = "smartgovcommunity"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Read Alexander permit documents from MongoDB and import them through the admin API."
+        description="Read Columbus permit documents from MongoDB and import them through the admin API."
     )
     parser.add_argument("--permit-id", help="Specific permits document _id to import.")
     parser.add_argument(
         "--source-url",
-        default=ALEXANDER_SOURCE_URL,
+        default=COLUMBUS_SOURCE_URL,
         help="Filter permit documents by source_url.",
     )
     parser.add_argument(
         "--state",
-        default=ALEXANDER_STATE,
+        default=COLUMBUS_STATE,
         help="Filter permit documents by state_name.",
     )
     parser.add_argument(
         "--county",
-        default=ALEXANDER_COUNTY,
+        default=COLUMBUS_COUNTY,
         help="Filter permit documents by county_name.",
     )
     parser.add_argument("--agency", help="Filter permit documents by agency_key.")
@@ -44,7 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adapter-name", help="Filter permit documents by adapter_name.")
     parser.add_argument(
         "--provider",
-        default=ALEXANDER_PROVIDER,
+        default=COLUMBUS_PROVIDER,
         help="Override payload provider.",
     )
     parser.add_argument("--fips", help="Attach a FIPS code to the payload.")
@@ -90,8 +90,6 @@ if __name__ == "__main__":
 
 
 # cd /home/sourabh/CrawlPy/scraper_framework
-# python scraper_framework/adapters/generic/alexander_admin_import.py --dry-run
-
-# cd /home/sourabh/CrawlPy/scraper_framework
-# python scraper_framework/adapters/generic/alexander_admin_import.py --dry-run --limit 1
-
+# python scraper_framework/adapters/generic/columbus_admin_import.py --dry-run
+# python scraper_framework/adapters/generic/columbus_admin_import.py
+# python scraper_framework/adapters/generic/columbus_admin_import.py --permit-id 6a4f8f2bf5ec84f81443c45d --dry-run

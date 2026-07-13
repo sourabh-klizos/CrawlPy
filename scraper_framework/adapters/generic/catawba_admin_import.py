@@ -10,33 +10,33 @@ if __package__ in {None, ""}:
 from adapters.accela.mongo_admin_import import run_import
 
 
-ALEXANDER_SOURCE_URL = (
-    "https://co-alexander-nc.smartgovcommunity.com/"
+CATAWBA_SOURCE_URL = (
+    "https://co-catawba-nc.smartgovcommunity.com/"
     "ApplicationPublic/ApplicationSearchAdvanced/Search"
 )
-ALEXANDER_STATE = "North Carolina"
-ALEXANDER_COUNTY = "Alexander"
-ALEXANDER_PROVIDER = "smartgovcommunity"
+CATAWBA_STATE = "North Carolina"
+CATAWBA_COUNTY = "Catawba"
+CATAWBA_PROVIDER = "smartgovcommunity"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Read Alexander permit documents from MongoDB and import them through the admin API."
+        description="Read Catawba permit documents from MongoDB and import them through the admin API."
     )
     parser.add_argument("--permit-id", help="Specific permits document _id to import.")
     parser.add_argument(
         "--source-url",
-        default=ALEXANDER_SOURCE_URL,
+        default=CATAWBA_SOURCE_URL,
         help="Filter permit documents by source_url.",
     )
     parser.add_argument(
         "--state",
-        default=ALEXANDER_STATE,
+        default=CATAWBA_STATE,
         help="Filter permit documents by state_name.",
     )
     parser.add_argument(
         "--county",
-        default=ALEXANDER_COUNTY,
+        default=CATAWBA_COUNTY,
         help="Filter permit documents by county_name.",
     )
     parser.add_argument("--agency", help="Filter permit documents by agency_key.")
@@ -44,7 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adapter-name", help="Filter permit documents by adapter_name.")
     parser.add_argument(
         "--provider",
-        default=ALEXANDER_PROVIDER,
+        default=CATAWBA_PROVIDER,
         help="Override payload provider.",
     )
     parser.add_argument("--fips", help="Attach a FIPS code to the payload.")
@@ -90,8 +90,6 @@ if __name__ == "__main__":
 
 
 # cd /home/sourabh/CrawlPy/scraper_framework
-# python scraper_framework/adapters/generic/alexander_admin_import.py --dry-run
-
-# cd /home/sourabh/CrawlPy/scraper_framework
-# python scraper_framework/adapters/generic/alexander_admin_import.py --dry-run --limit 1
-
+# python scraper_framework/adapters/generic/catawba_admin_import.py --dry-run
+# python scraper_framework/adapters/generic/catawba_admin_import.py
+# python scraper_framework/adapters/generic/catawba_admin_import.py --permit-id 6a4f8eb78c2f5424c57b36c4 --dry-run

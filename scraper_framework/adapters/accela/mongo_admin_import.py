@@ -63,8 +63,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--limit",
         type=int,
-        default=1,
-        help="How many matching permit documents to process, newest first. Defaults to 1.",
+        default=None,
+        help="How many matching permit documents to process, newest first. Defaults to all matches.",
     )
     parser.add_argument(
         "--dry-run",
@@ -103,11 +103,13 @@ def build_query(args: argparse.Namespace) -> dict[str, Any]:
     return query
 
 
-def fetch_permits(store: MongoStore, query: dict[str, Any], limit: int) -> list[dict[str, Any]]:
-    if limit <= 0:
+def fetch_permits(store: MongoStore, query: dict[str, Any], limit: int | None) -> list[dict[str, Any]]:
+    if limit is not None and limit <= 0:
         raise ValueError("--limit must be greater than 0.")
 
-    cursor = store._collection("permits").find(query).sort("crawl_timestamp", -1).limit(limit)
+    cursor = store._collection("permits").find(query).sort("crawl_timestamp", -1)
+    if limit is not None:
+        cursor = cursor.limit(limit)
     return list(cursor)
 
 
@@ -400,3 +402,7 @@ if __name__ == "__main__":
 # python scraper_framework/adapters/accela/mongo_admin_import.py --agency COOPER_CITY --module Building
 
 # python scraper_framework/adapters/accela/mongo_admin_import.py --permit-id 6a4fb949f5eebd00afb24b99 --dry-run # for specific permit id
+
+
+# cd /home/sourabh/CrawlPy/scraper_framework
+# python scraper_framework/adapters/accela/mongo_admin_import.py --agency COOPER_CITY --module Building --dry-run
