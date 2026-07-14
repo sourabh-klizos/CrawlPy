@@ -6,10 +6,13 @@ import threading
 from pathlib import Path
 from typing import Any, Iterable
 
+from bs4 import BeautifulSoup
+
 from adapters.accela.constants import URLS as ACCELA_URLS
 from adapters.accela.adapter import AccelaAdapter
 from adapters.base.base_adapter import BaseAdapter
 from adapters.detector import AdapterDetector, build_adapters
+from adapters.iworq_platform.constants import URLS as IWORQ_PLATFORM_URLS
 from adapters.smartgov.constants import SMARTGOV_URLS, STATE_NAMES
 from adapters.smartgov.adapter import SmartGovAdapter
 from db.mongo_client import MongoStore
@@ -181,6 +184,21 @@ def load_accela_urls(agencies: Iterable[str] | None = None, modules: Iterable[st
     return selected_urls
 
 
+def load_iworq_platform_urls(agencies: Iterable[str] | None = None) -> list[str]:
+    agency_filter = {value.strip().upper() for value in (agencies or []) if value.strip()}
+    selected_urls: list[str] = []
+
+    for agency_key, agency_config in IWORQ_PLATFORM_URLS.items():
+        if agency_filter and agency_key.upper() not in agency_filter:
+            continue
+
+        url = agency_config.get("url")
+        if url:
+            selected_urls.append(url)
+
+    return selected_urls
+
+
 def get_source_metadata(source_url: str) -> dict[str, str | None]:
     for agency_key, agency_config in ACCELA_URLS.items():
         target_scrape_urls = agency_config.get("target_scrape_urls", {})
@@ -189,9 +207,18 @@ def get_source_metadata(source_url: str) -> dict[str, str | None]:
                 return {
                     "agency_key": agency_key,
                     "county_name": agency_config.get("agency_name"),
-                    "state_name": None,
+                    "state_name": agency_config.get("state_name") or agency_config.get("state"),
                     "module_name": module_name,
                 }
+
+    for agency_key, agency_config in IWORQ_PLATFORM_URLS.items():
+        if agency_config.get("url") == source_url:
+            return {
+                "agency_key": agency_key,
+                "county_name": agency_config.get("county_name") or agency_config.get("agency_name"),
+                "state_name": agency_config.get("state_name") or agency_config.get("state"),
+                "module_name": None,
+            }
 
     return {
         "agency_key": None,
@@ -242,6 +269,19 @@ def limit_urls(urls: list[str], limit: int | None = None) -> list[str]:
     return urls[:limit]
 
 
+def get_bootstrap_adapter(url: str, adapters: Iterable[BaseAdapter]) -> BaseAdapter:
+    empty_soup = BeautifulSoup("", "html.parser")
+    adapters_by_name = {adapter.name: adapter for adapter in adapters}
+
+    for adapter in adapters:
+        if adapter.name == "accela":
+            continue
+        if adapter.can_handle(url, "", empty_soup):
+            return adapter
+
+    return adapters_by_name.get("accela") or next(iter(adapters))
+
+
 def crawl(
     urls: Iterable[str],
     headed: bool = False,
@@ -259,7 +299,7 @@ def crawl(
             permit_types=smartgov_permit_types,
         )
     for adapter in adapters:
-        if isinstance(adapter, (AccelaAdapter, SmartGovAdapter)):
+        if hasattr(adapter, "headed"):
             adapter.headed = headed
     detector = AdapterDetector(adapters)
     store = MongoStore()
@@ -283,7 +323,7 @@ def crawl(
             elif "accela" in source_url.lower() and accela_adapter:
                 bootstrap_adapter = accela_adapter
             else:
-                bootstrap_adapter = adapters[0]
+                bootstrap_adapter = get_bootstrap_adapter(source_url, adapters)
 
             selected_adapter = bootstrap_adapter
             run_id = store.create_run(
@@ -407,9 +447,9 @@ def parse_args() -> argparse.Namespace:
     default_urls_file = Path(__file__).resolve().parent / "urls.txt"
     parser.add_argument(
         "--source",
-        choices=("accela_constants", "smartgov_constants", "file"),
-        default="accela_constants",
-        help="Where to load URLs from. Defaults to the Accela URLS constant.",
+        choices=("accela_constants", "smartgov_constants", "iworq_platform_constants", "file"),
+        default="iworq_platform_constants",
+        help="Where to load URLs from. Defaults to the iWorQ Platform URLS constant.",
     )
     parser.add_argument(
         "--url",
@@ -480,6 +520,8 @@ def main() -> None:
         target_urls = load_smartgov_urls(args.county)
     elif args.source == "accela_constants":
         target_urls = load_accela_urls(args.agency, args.module)
+    elif args.source == "iworq_platform_constants":
+        target_urls = load_iworq_platform_urls(args.agency)
     else:
         target_urls = load_urls_from_file(args.urls)
 

@@ -1,28 +1,35 @@
 from __future__ import annotations
 
+from importlib import import_module
+
 from bs4 import BeautifulSoup
 
-from adapters.accela.adapter import AccelaAdapter
-from adapters.arcgis.adapter import ArcGISAdapter
 from adapters.base.base_adapter import BaseAdapter
-from adapters.civicplus.adapter import CivicPlusAdapter
 from adapters.generic.adapter import GenericAdapter
-from adapters.mygovernmentonline.adapter import MyGovernmentOnlineAdapter
-from adapters.opengov.adapter import OpenGovAdapter
-from adapters.smartgov.adapter import SmartGovAdapter
-from adapters.tyler_energov.adapter import TylerEnerGovAdapter
 
 
 def build_adapters() -> list[BaseAdapter]:
-    return [
-        AccelaAdapter(),
-        SmartGovAdapter(),
-        MyGovernmentOnlineAdapter(),
-        TylerEnerGovAdapter(),
-        OpenGovAdapter(),
-        ArcGISAdapter(),
-        CivicPlusAdapter(),
+    adapter_specs = [
+        ("adapters.accela.adapter", "AccelaAdapter"),
+        ("adapters.smartgov.adapter", "SmartGovAdapter"),
+        ("adapters.mygovernmentonline.adapter", "MyGovernmentOnlineAdapter"),
+        ("adapters.tyler_energov.adapter", "TylerEnerGovAdapter"),
+        ("adapters.opengov.adapter", "OpenGovAdapter"),
+        ("adapters.arcgis.adapter", "ArcGISAdapter"),
+        ("adapters.civicplus.adapter", "CivicPlusAdapter"),
+        ("adapters.iworq_platform.adapter", "IworqPlatformAdapter"),
     ]
+    adapters: list[BaseAdapter] = []
+
+    for module_path, class_name in adapter_specs:
+        try:
+            module = import_module(module_path)
+            adapter_class = getattr(module, class_name)
+        except ModuleNotFoundError:
+            continue
+        adapters.append(adapter_class())
+
+    return adapters
 
 
 class AdapterDetector:

@@ -9,15 +9,26 @@ from urllib.parse import quote_plus
 
 from pymongo import MongoClient
 from pymongo.collection import Collection
+from pymongo.cursor import Cursor
 
-from config.settings import (
-    MONGODB_DB,
-    MONGODB_HOST,
-    MONGODB_PARAMS,
-    MONGODB_PASSWORD,
-    MONGODB_SRV,
-    MONGODB_USERNAME,
-)
+try:
+    from config.settings import (
+        MONGODB_DB,
+        MONGODB_HOST,
+        MONGODB_PARAMS,
+        MONGODB_PASSWORD,
+        MONGODB_SRV,
+        MONGODB_USERNAME,
+    )
+except ModuleNotFoundError:
+    from scraper_framework.config.settings import (
+        MONGODB_DB,
+        MONGODB_HOST,
+        MONGODB_PARAMS,
+        MONGODB_PASSWORD,
+        MONGODB_SRV,
+        MONGODB_USERNAME,
+    )
 
 
 class MongoStore:
@@ -43,20 +54,41 @@ class MongoStore:
     def _collection(self, name: str) -> Collection:
         return self.db[name]
 
+    def find_documents(
+        self,
+        collection_name: str,
+        query: dict[str, Any] | None = None,
+        sort: list[tuple[str, int]] | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        cursor: Cursor = self._collection(collection_name).find(query or {})
+        if sort:
+            cursor = cursor.sort(sort)
+        if limit is not None and limit > 0:
+            cursor = cursor.limit(limit)
+        return list(cursor)
+
+    def insert_many_documents(self, collection_name: str, documents: list[dict[str, Any]]) -> int:
+        if not documents:
+            return 0
+
+        result = self._collection(collection_name).insert_many(documents)
+        return len(result.inserted_ids)
+
     def create_run(
         self,
         source_url: str,
         adapter_name: str,
-        county_name: str | None = None,
         state_name: str | None = None,
+        county_name: str | None = None,
         agency_key: str | None = None,
         module_name: str | None = None,
     ) -> Any:
         payload = {
             "source_url": source_url,
             "adapter_name": adapter_name,
-            "county_name": county_name,
             "state_name": state_name,
+            "county_name": county_name,
             "agency_key": agency_key,
             "module_name": module_name,
             "status": "running",
@@ -94,8 +126,8 @@ class MongoStore:
         self,
         source_url: str,
         adapter_name: str,
-        county_name: str | None = None,
         state_name: str | None = None,
+        county_name: str | None = None,
         agency_key: str | None = None,
         module_name: str | None = None,
     ) -> None:
@@ -105,8 +137,8 @@ class MongoStore:
                 "$set": {
                     "source_url": source_url,
                     "adapter_name": adapter_name,
-                    "county_name": county_name,
                     "state_name": state_name,
+                    "county_name": county_name,
                     "agency_key": agency_key,
                     "module_name": module_name,
                     "updated_at": datetime.now(timezone.utc),
@@ -118,8 +150,8 @@ class MongoStore:
 
     def save_permit(
         self,
-        county_name: str | None,
         state_name: str | None,
+        county_name: str | None,
         agency_key: str | None,
         module_name: str | None,
         source_url: str,
@@ -190,8 +222,8 @@ class MongoStore:
 
     def save_raw_result_batch(
         self,
-        county_name: str | None,
         state_name: str | None,
+        county_name: str | None,
         agency_key: str | None,
         module_name: str | None,
         source_url: str,
@@ -203,6 +235,10 @@ class MongoStore:
         now = datetime.now(timezone.utc)
         batch_hash = self._hash_payload(
             {
+                "state_name": state_name,
+                "county_name": county_name,
+                "agency_key": agency_key,
+                "module_name": module_name,
                 "source_url": source_url,
                 "adapter_name": adapter_name,
                 "raw_items": raw_items,
@@ -281,3 +317,48 @@ class MongoStore:
     def _hash_payload(self, payload: dict[str, Any]) -> str:
         encoded = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":"))
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+    def find_already_pushed(
+        self,
+        payload_hash: str,
+        identity_filter: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        identity_query = {f"identity_filter.{key}": value for key, value in identity_filter.items()}
+        return self._collection("already_pushed").find_one(
+            {
+                "$or": [
+                    {"payload_hash": payload_hash},
+                    identity_query,
+                ]
+            }
+        )
+
+    def save_already_pushed(
+        self,
+        *,
+        permit_id: Any,
+        payload_hash: str,
+        identity_filter: dict[str, Any],
+        payload_record: dict[str, Any],
+        payload_metadata: dict[str, Any],
+        api_response: dict[str, Any],
+    ) -> None:
+        self._collection("already_pushed").update_one(
+            {"permit_id": permit_id},
+            {
+                "$set": {
+                    "permit_id": permit_id,
+                    "payload_hash": payload_hash,
+                    "identity_filter": identity_filter,
+                    "payload_record": payload_record,
+                    "payload_metadata": payload_metadata,
+                    "api_response": api_response,
+                    "updated_at": datetime.now(timezone.utc),
+                },
+                "$setOnInsert": {
+                    "created_at": datetime.now(timezone.utc),
+                },
+            },
+            upsert=True,
+        )
