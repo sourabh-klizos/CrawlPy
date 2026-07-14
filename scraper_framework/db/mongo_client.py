@@ -24,6 +24,7 @@ class MongoStore:
     def __init__(self) -> None:
         self.client = MongoClient(self._build_uri())
         self.db = self.client[MONGODB_DB]
+        self._indexed_collections: set[str] = set()
 
     def _build_uri(self) -> str:
         scheme = "mongodb+srv" if MONGODB_SRV else "mongodb"
@@ -238,11 +239,14 @@ class MongoStore:
         return slug or "unknown"
 
     def _ensure_hash_index(self, collection: Collection) -> None:
+        if collection.name in self._indexed_collections:
+            return
         collection.create_index(
             "record_hash",
             unique=True,
             partialFilterExpression={"record_hash": {"$exists": True}},
         )
+        self._indexed_collections.add(collection.name)
 
     def _record_hash(
         self,

@@ -242,10 +242,22 @@ def limit_urls(urls: list[str], limit: int | None = None) -> list[str]:
     return urls[:limit]
 
 
-def crawl(urls: Iterable[str], headed: bool = False) -> None:
+def crawl(
+    urls: Iterable[str],
+    headed: bool = False,
+    smartgov_scrape_details: bool = True,
+    smartgov_detail_concurrency: int | None = None,
+    smartgov_permit_types: list[str] | None = None,
+) -> None:
     adapters: list[BaseAdapter] = build_adapters()
     accela_adapter = next((adapter for adapter in adapters if isinstance(adapter, AccelaAdapter)), None)
     smartgov_adapter = next((adapter for adapter in adapters if isinstance(adapter, SmartGovAdapter)), None)
+    if smartgov_adapter is not None:
+        smartgov_adapter.configure(
+            scrape_details=smartgov_scrape_details,
+            detail_concurrency=smartgov_detail_concurrency,
+            permit_types=smartgov_permit_types,
+        )
     for adapter in adapters:
         if isinstance(adapter, (AccelaAdapter, SmartGovAdapter)):
             adapter.headed = headed
@@ -439,6 +451,23 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Limit the number of resolved URLs, useful for testing with 1 site.",
     )
+    parser.add_argument(
+        "--smartgov-skip-details",
+        action="store_true",
+        help="SmartGov only: save result-list rows without opening each detail page.",
+    )
+    parser.add_argument(
+        "--smartgov-detail-concurrency",
+        type=int,
+        default=None,
+        help="SmartGov only: number of detail pages to fetch concurrently.",
+    )
+    parser.add_argument(
+        "--smartgov-permit-type",
+        action="append",
+        default=[],
+        help="SmartGov only: exact Type dropdown label to scrape. Can be repeated.",
+    )
     return parser.parse_args()
 
 
@@ -459,7 +488,13 @@ def main() -> None:
     if not target_urls:
         raise ValueError("No URLs were resolved. Check your constants, agency filters, or module filters.")
 
-    crawl(target_urls, headed=args.headed)
+    crawl(
+        target_urls,
+        headed=args.headed,
+        smartgov_scrape_details=not args.smartgov_skip_details,
+        smartgov_detail_concurrency=args.smartgov_detail_concurrency,
+        smartgov_permit_types=args.smartgov_permit_type,
+    )
 
 
 if __name__ == "__main__":

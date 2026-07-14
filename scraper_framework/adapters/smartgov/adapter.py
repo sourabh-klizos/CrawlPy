@@ -6,7 +6,7 @@ from bs4 import BeautifulSoup
 from adapters.base.base_adapter import BaseAdapter
 
 from .client import SmartGovAdapterClient
-from .constants import ADAPTER_NAME
+from .constants import ADAPTER_NAME, SMARTGOV_BLOCKED_RESOURCE_TYPES
 from .detector import is_match
 from .extractor import extract_records
 from .parser import parse_rows
@@ -24,6 +24,19 @@ class SmartGovAdapter(BaseAdapter):
         self.raw_batch_callback: Callable[[list[dict[str, Any]]], None] | None = None
         self.workflow = SmartGovPlaywrightWorkflow(
             request_timeout_ms=self.client.request_timeout_seconds * 1000
+        )
+
+    def configure(
+        self,
+        *,
+        scrape_details: bool | None = None,
+        detail_concurrency: int | None = None,
+        permit_types: list[str] | None = None,
+    ) -> None:
+        self.workflow.configure(
+            scrape_details=scrape_details,
+            detail_concurrency=detail_concurrency,
+            permit_types=permit_types,
         )
 
     def set_raw_batch_callback(
@@ -46,6 +59,7 @@ class SmartGovAdapter(BaseAdapter):
                 args=["--no-sandbox", "--disable-setuid-sandbox"],
             )
             context = await self.client.build_async_browser_context(browser)
+            await self.install_fast_resource_blocking(context)
             page = await context.new_page()
             html = await self.workflow.run(page, url)
             self.raw_batches = self.workflow.result_record_batches
@@ -57,6 +71,16 @@ class SmartGovAdapter(BaseAdapter):
             await context.close()
             await browser.close()
             return html
+
+    async def install_fast_resource_blocking(self, context: Any) -> None:
+        async def route_handler(route: Any) -> None:
+            request = route.request
+            if request.resource_type in SMARTGOV_BLOCKED_RESOURCE_TYPES:
+                await route.abort()
+                return
+            await route.continue_()
+
+        await context.route("**/*", route_handler)
 
     def can_handle(self, url: str, html: str, soup: BeautifulSoup) -> bool:
         return is_match(url, html, soup)

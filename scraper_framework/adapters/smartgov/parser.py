@@ -14,7 +14,7 @@ TABLE_SELECTORS = [
     "table.table",
     "table",
 ]
-SMARTGOV_RECORD_NUMBER_RE = re.compile(r"^(?:[A-Z]+-)?\d{2,4}(?:-\d{2,})+")
+SMARTGOV_RECORD_NUMBER_RE = re.compile(r"^(?:[A-Z]+-)?\d{2,8}(?:-\d{2,})+")
 SMARTGOV_DETAIL_ACTION_RE = re.compile(
     r"(https?://[^\s'\"<>]+/PermittingPublic/PermitLandingPagePublic/Index/[^\s'\"<>]+"
     r"|/?PermittingPublic/PermitLandingPagePublic/Index/[^\s'\"<>]+"

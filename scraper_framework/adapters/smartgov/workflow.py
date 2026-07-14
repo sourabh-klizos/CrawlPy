@@ -18,6 +18,7 @@ from .constants import (
     MAX_CONCURRENT_PAGES,
     SEARCH_WINDOW_YEARS,
     SMARTGOV_URLS,
+    SMARTGOV_DETAIL_CONCURRENCY,
     WORKER_PAGE_NAVIGATION_RETRIES,
 )
 from .parser import (
@@ -50,7 +51,41 @@ class SmartGovPlaywrightWorkflow:
     )
     pagination_cell_selector = ".aca_pagination td.aca_pagination_td, .pagination li, ul.pagination li"
     pagination_more_texts = ("...", "…")
-    pagination_next_texts = ("Next", "›", ">", "»")
+    pagination_next_texts = ("next", "next page", "go to next", "›", ">", "»")
+    lazy_load_more_texts = ("load more", "show more", "more results", "view more")
+    pagination_control_selector = (
+        ".aca_pagination td.aca_pagination_td a, "
+        "nav[aria-label*='Pagination'] a, "
+        "nav[aria-label*='pagination'] a, "
+        ".pagination a, "
+        "ul.pagination a, "
+        "a.page-link, "
+        "button, "
+        "[role='button'], "
+        "[role='link']"
+    )
+    discovered_type_category_rules = (
+        (
+            "Building (Commercial)",
+            re.compile(r"(?=.*\bcommercial\b)(?=.*\b(new|construction|building)\b)", re.I),
+        ),
+        (
+            "Building (Residential)",
+            re.compile(
+                r"(?=.*\b(residential|single family|duplex|townhouse)\b)"
+                r"(?=.*\b(new|construction|building)\b)",
+                re.I,
+            ),
+        ),
+        (
+            "Manufactured & Mobile Homes",
+            re.compile(
+                r"(?=.*\b(manufactured|mobile|modular)\b)"
+                r"(?=.*\b(home|housing|dwelling|permit)\b)",
+                re.I,
+            ),
+        ),
+    )
 
     def __init__(self, request_timeout_ms: int) -> None:
         self.request_timeout_ms = request_timeout_ms
@@ -58,7 +93,29 @@ class SmartGovPlaywrightWorkflow:
         self.result_record_batches: list[list[dict[str, Any]]] = []
         self.result_batch_callback: Callable[[list[dict[str, Any]]], None] | None = None
         self.page_semaphore = asyncio.Semaphore(MAX_CONCURRENT_PAGES)
-        self.detail_page_semaphore = asyncio.Semaphore(MAX_CONCURRENT_PAGES)
+        self.detail_page_semaphore = asyncio.Semaphore(SMARTGOV_DETAIL_CONCURRENCY)
+        self.scrape_details = True
+        self.detail_concurrency = SMARTGOV_DETAIL_CONCURRENCY
+        self.permit_type_filter: set[str] = set()
+
+    def configure(
+        self,
+        *,
+        scrape_details: bool | None = None,
+        detail_concurrency: int | None = None,
+        permit_types: list[str] | None = None,
+    ) -> None:
+        if scrape_details is not None:
+            self.scrape_details = scrape_details
+        if detail_concurrency is not None and detail_concurrency > 0:
+            self.detail_concurrency = detail_concurrency
+            self.detail_page_semaphore = asyncio.Semaphore(detail_concurrency)
+        if permit_types is not None:
+            self.permit_type_filter = {
+                permit_type.strip().casefold()
+                for permit_type in permit_types
+                if permit_type.strip()
+            }
 
     async def run(self, page: Any, url: str) -> str:
         self.result_pages_html = []
@@ -79,9 +136,19 @@ class SmartGovPlaywrightWorkflow:
         """Hook immediately after the initial page load finishes."""
 
     async def apply_site_logic(self, page: Any, url: str) -> None:
-        permit_type_groups = self.get_permit_type_groups(url)
+        permit_type_groups = await self.get_permit_type_groups(page, url)
         permit_types = self.get_target_permit_types(permit_type_groups)
         print(f"Permit types to scrape ({len(permit_types)} total): {permit_types}")
+        if not permit_types:
+            if self.permit_type_filter:
+                available_types = self.get_all_configured_permit_types(permit_type_groups)
+                raise ValueError(
+                    "No SmartGov permit types matched --smartgov-permit-type. "
+                    f"Requested: {sorted(self.permit_type_filter)}. "
+                    f"Available: {available_types}"
+                )
+            print("No SmartGov permit types matched this county; skipping.")
+            return
 
         type_to_category = self.get_type_to_category(permit_type_groups)
 
@@ -94,15 +161,20 @@ class SmartGovPlaywrightWorkflow:
             finally:
                 await tab_page.close()
 
-    def get_permit_type_groups(self, url: str) -> dict[str, list[str]]:
+    async def get_permit_type_groups(self, page: Any, url: str) -> dict[str, list[str]]:
         county_key = self.get_county_key(url)
         if not county_key:
             raise ValueError(f"SmartGov URL is not configured in SMARTGOV_URLS: {url}")
-        if county_key not in COUNTY_PERMIT_TYPE_GROUPS:
-            raise ValueError(
-                f"No SmartGov permit type groups configured for county key: {county_key}"
-            )
-        return COUNTY_PERMIT_TYPE_GROUPS[county_key]
+        configured_groups = COUNTY_PERMIT_TYPE_GROUPS.get(county_key)
+        if configured_groups is not None:
+            return configured_groups
+
+        discovered_groups = await self.discover_permit_type_groups(page)
+        print(
+            f"No SmartGov permit type groups configured for {county_key}; "
+            f"discovered target groups from dropdown: {discovered_groups}"
+        )
+        return discovered_groups
 
     def get_county_key(self, url: str) -> str | None:
         for county_key, county_config in SMARTGOV_URLS.items():
@@ -116,6 +188,25 @@ class SmartGovPlaywrightWorkflow:
         The list preserves the category order and the within-category order defined
         in constants.py.  Each label will be selected one-by-one in the Type dropdown.
         """
+        permit_types: list[str] = []
+        seen: set[str] = set()
+        for types in permit_type_groups.values():
+            for permit_type in types:
+                if (
+                    self.permit_type_filter
+                    and permit_type.casefold() not in self.permit_type_filter
+                ):
+                    continue
+                if permit_type in seen:
+                    continue
+                permit_types.append(permit_type)
+                seen.add(permit_type)
+        return permit_types
+
+    def get_all_configured_permit_types(
+        self,
+        permit_type_groups: dict[str, list[str]],
+    ) -> list[str]:
         permit_types: list[str] = []
         seen: set[str] = set()
         for types in permit_type_groups.values():
@@ -134,6 +225,29 @@ class SmartGovPlaywrightWorkflow:
         return {
             permit_type: "; ".join(categories)
             for permit_type, categories in type_to_categories.items()
+        }
+
+    async def discover_permit_type_groups(self, page: Any) -> dict[str, list[str]]:
+        dropdown = await self.find_type_dropdown(page)
+        all_options = await dropdown.locator("option").all_inner_texts()
+        groups: dict[str, list[str]] = {
+            category: []
+            for category, _pattern in self.discovered_type_category_rules
+        }
+
+        for raw_option in all_options:
+            option_text = raw_option.strip()
+            if not option_text or option_text.lower() in {"select", "all", "-- select --"}:
+                continue
+            for category, pattern in self.discovered_type_category_rules:
+                if pattern.search(option_text):
+                    groups[category].append(option_text)
+                    break
+
+        return {
+            category: permit_types
+            for category, permit_types in groups.items()
+            if permit_types
         }
 
     async def validate_permit_type_on_page(
@@ -261,18 +375,44 @@ class SmartGovPlaywrightWorkflow:
         await self.wait_for_results_page(page)
         current_page_num = 1
         processed_pages: set[int] = set()
+        seen_record_numbers: set[str] = set()
+        total_results = await self.get_result_count(page)
+        if total_results is not None:
+            print(f"[{category}] Portal reports {total_results} results for {option_text}.")
 
         while True:
             print(f"[{category}] Capturing {option_text} results page {current_page_num}...")
-            await self.capture_result_page(page, url, option_text, category, current_page_num)
+            _html, records = await self.capture_result_page(
+                page,
+                url,
+                option_text,
+                category,
+                current_page_num,
+                seen_record_numbers,
+            )
             processed_pages.add(current_page_num)
+            if not records:
+                print(
+                    f"[{category}] No records parsed for {option_text} page "
+                    f"{current_page_num}; moving to next permit type."
+                )
+                break
+            if total_results is not None and len(seen_record_numbers) >= total_results:
+                print(
+                    f"[{category}] Reached reported result count for {option_text}: "
+                    f"{len(seen_record_numbers)}/{total_results}"
+                )
+                break
 
             next_page_num = await self.click_next_unprocessed_results_page(
                 page,
                 processed_pages,
                 current_page_num,
+                url,
+                seen_record_numbers,
             )
             if next_page_num is None:
+                await self.print_pagination_stop_debug(page, processed_pages, current_page_num)
                 break
             current_page_num = next_page_num
 
@@ -286,41 +426,119 @@ class SmartGovPlaywrightWorkflow:
         page: Any,
         processed_pages: set[int],
         current_page_num: int,
+        url: str,
+        seen_record_numbers: set[str],
     ) -> int | None:
+        next_expected_page = current_page_num + 1
+        if await self.click_page_number_if_visible(page, next_expected_page, seen_record_numbers):
+            return next_expected_page
+
         visible_pages = await self.get_visible_page_numbers(page, processed_pages)
         if visible_pages:
             next_page_num = visible_pages[0]
-            if await self.click_page_number_if_visible(page, next_page_num):
+            if await self.click_page_number_if_visible(page, next_page_num, seen_record_numbers):
                 return next_page_num
 
-        if await self.click_next_pagination_control(page):
-            await self.wait_for_results_page(page)
+        if await self.click_next_pagination_control(page, seen_record_numbers):
             return current_page_num + 1
 
         for more_text in self.pagination_more_texts:
-            if await self.click_special_pagination_control(page, more_text):
+            if await self.click_special_pagination_control(page, more_text, seen_record_numbers):
                 new_visible_pages = await self.get_visible_page_numbers(page, processed_pages)
                 if new_visible_pages:
                     next_page_num = new_visible_pages[0]
-                    if await self.click_page_number_if_visible(page, next_page_num):
+                    if await self.click_page_number_if_visible(page, next_page_num, seen_record_numbers):
                         return next_page_num
 
+        if await self.advance_lazy_loaded_results(page, seen_record_numbers):
+            return current_page_num + 1
+
         return None
+
+    async def get_result_count(self, page: Any) -> int | None:
+        try:
+            body_text = await page.locator("body").inner_text(timeout=3000)
+        except Exception:  # noqa: BLE001
+            return None
+        match = re.search(r"\b([0-9][0-9,]*)\s+results\b", body_text, re.I)
+        if not match:
+            return None
+        return int(match.group(1).replace(",", ""))
+
+    async def advance_lazy_loaded_results(
+        self,
+        page: Any,
+        seen_record_numbers: set[str],
+    ) -> bool:
+        for _attempt in range(8):
+            await self.click_load_more_control(page)
+            await page.evaluate(
+                """() => {
+                    const scrollTargets = [
+                        document.scrollingElement,
+                        document.documentElement,
+                        document.body,
+                        ...Array.from(document.querySelectorAll(
+                            '[style*="overflow"], .results, .search-results, main, section'
+                        ))
+                    ].filter(Boolean);
+                    for (const target of scrollTargets) {
+                        try {
+                            target.scrollTop = target.scrollHeight;
+                        } catch (_) {}
+                    }
+                    window.scrollTo(0, document.body.scrollHeight);
+                }"""
+            )
+            await page.wait_for_timeout(1000)
+            loaded_record_numbers = await self.get_loaded_record_numbers(page)
+            if any(record_number not in seen_record_numbers for record_number in loaded_record_numbers):
+                print("SmartGov lazy-loaded more result records.")
+                return True
+        return False
+
+    async def click_load_more_control(self, page: Any) -> bool:
+        controls = page.locator(self.pagination_control_selector)
+        for index in range(await controls.count()):
+            control = controls.nth(index)
+            if not await control.is_visible():
+                continue
+            if await self.is_disabled_pagination_control(control):
+                continue
+            text = " ".join((await control.inner_text()).split()).casefold()
+            aria_label = (await control.get_attribute("aria-label") or "").casefold()
+            title = (await control.get_attribute("title") or "").casefold()
+            candidates = (text, aria_label, title)
+            if any(load_text in candidate for candidate in candidates for load_text in self.lazy_load_more_texts):
+                await self.click_and_wait_for_results(page, control)
+                return True
+        return False
+
+    async def get_loaded_record_numbers(self, page: Any) -> list[str]:
+        links = page.locator("a")
+        record_numbers: list[str] = []
+        for index in range(await links.count()):
+            link = links.nth(index)
+            try:
+                text = " ".join((await link.inner_text()).split())
+            except Exception:  # noqa: BLE001
+                continue
+            if self.smartgov_record_link_pattern.match(text):
+                record_numbers.append(text)
+        return record_numbers
 
     async def get_visible_page_numbers(self, page: Any, processed_pages: set[int]) -> list[int]:
         visible_pages: list[int] = []
 
-        for selector in (self.pagination_link_selector, "a"):
+        for selector in (self.pagination_control_selector, "a"):
             page_links = page.locator(selector)
             for index in range(await page_links.count()):
                 link = page_links.nth(index)
                 if not await link.is_visible():
                     continue
-                link_text = (await link.inner_text()).strip()
-                if link_text.isdigit():
-                    page_num = int(link_text)
-                    if page_num not in processed_pages:
-                        visible_pages.append(page_num)
+                page_num = await self.pagination_control_page_number(link)
+                if page_num is not None and page_num not in processed_pages:
+                    visible_pages.append(page_num)
             if visible_pages:
                 break
 
@@ -342,7 +560,7 @@ class SmartGovPlaywrightWorkflow:
         pagination_cells = page.locator(self.pagination_cell_selector)
         for index in range(await pagination_cells.count()):
             cell = pagination_cells.nth(index)
-            cell_text = (await cell.inner_text()).strip()
+            cell_text = (await cell.inner_text()).strip().casefold()
             if not any(next_text in cell_text for next_text in self.pagination_next_texts):
                 continue
 
@@ -362,14 +580,35 @@ class SmartGovPlaywrightWorkflow:
 
         return False
 
-    async def click_page_number_if_visible(self, page: Any, target_page_num: int) -> bool:
-        for selector in (self.pagination_link_selector, "a"):
+    async def click_page_number_if_visible(
+        self,
+        page: Any,
+        target_page_num: int,
+        seen_record_numbers: set[str] | None = None,
+    ) -> bool:
+        for selector in (self.pagination_control_selector, "a"):
             page_links = page.locator(selector)
             for index in range(await page_links.count()):
                 link = page_links.nth(index)
-                link_text = (await link.inner_text()).strip()
-                if link_text == str(target_page_num) and await link.is_visible():
+                if not await link.is_visible():
+                    continue
+                page_num = await self.pagination_control_page_number(link)
+                if page_num == target_page_num and not await self.is_disabled_pagination_control(link):
                     await self.click_and_wait_for_results(page, link)
+                    if seen_record_numbers is not None:
+                        if await self.wait_for_new_result_records(page, seen_record_numbers):
+                            return True
+                        try:
+                            await link.evaluate("element => element.click()")
+                            if await self.wait_for_new_result_records(page, seen_record_numbers):
+                                return True
+                        except Exception:  # noqa: BLE001
+                            pass
+                        print(
+                            f"Clicked SmartGov page {target_page_num}, but no new "
+                            "record numbers appeared."
+                        )
+                        return False
                     return True
         return False
 
@@ -420,12 +659,14 @@ class SmartGovPlaywrightWorkflow:
 
     async def go_to_results_page(self, page: Any, current_page_num: int) -> bool:
         while True:
-            for selector in (self.pagination_link_selector, "a"):
+            for selector in (self.pagination_control_selector, "a"):
                 page_links = page.locator(selector)
                 for index in range(await page_links.count()):
                     link = page_links.nth(index)
-                    link_text = (await link.inner_text()).strip()
-                    if link_text == str(current_page_num) and await link.is_visible():
+                    if not await link.is_visible():
+                        continue
+                    page_num = await self.pagination_control_page_number(link)
+                    if page_num == current_page_num and not await self.is_disabled_pagination_control(link):
                         await self.click_and_wait_for_results(page, link)
                         return True
 
@@ -440,7 +681,7 @@ class SmartGovPlaywrightWorkflow:
         pagination_cells = page.locator(self.pagination_cell_selector)
         for index in range(await pagination_cells.count()):
             cell = pagination_cells.nth(index)
-            cell_text = (await cell.inner_text()).strip()
+            cell_text = (await cell.inner_text()).strip().casefold()
             if not any(next_text in cell_text for next_text in self.pagination_next_texts):
                 continue
 
@@ -456,36 +697,152 @@ class SmartGovPlaywrightWorkflow:
 
         return False
 
-    async def click_special_pagination_control(self, page: Any, control_text: str) -> bool:
-        for selector in (self.pagination_link_selector, "a"):
+    async def click_special_pagination_control(
+        self,
+        page: Any,
+        control_text: str,
+        seen_record_numbers: set[str] | None = None,
+    ) -> bool:
+        for selector in (self.pagination_control_selector, "a"):
             page_links = page.locator(selector)
             for index in range(await page_links.count()):
                 link = page_links.nth(index)
                 link_text = (await link.inner_text()).strip()
-                if link_text == control_text and await link.is_visible():
+                if (
+                    link_text == control_text
+                    and await link.is_visible()
+                    and not await self.is_disabled_pagination_control(link)
+                ):
                     await self.click_and_wait_for_results(page, link)
+                    if seen_record_numbers is not None:
+                        if await self.wait_for_new_result_records(page, seen_record_numbers):
+                            return True
+                        try:
+                            await link.evaluate("element => element.click()")
+                            return await self.wait_for_new_result_records(page, seen_record_numbers)
+                        except Exception:  # noqa: BLE001
+                            return False
                     return True
         return False
 
-    async def click_next_pagination_control(self, page: Any) -> bool:
-        for selector in (self.pagination_link_selector, "a"):
+    async def click_next_pagination_control(
+        self,
+        page: Any,
+        seen_record_numbers: set[str] | None = None,
+    ) -> bool:
+        for selector in (self.pagination_control_selector, "a"):
             page_links = page.locator(selector)
             for index in range(await page_links.count()):
                 link = page_links.nth(index)
                 if not await link.is_visible():
                     continue
+                if await self.is_disabled_pagination_control(link):
+                    continue
                 link_text = (await link.inner_text()).strip()
                 aria_label = (await link.get_attribute("aria-label") or "").strip()
                 title = (await link.get_attribute("title") or "").strip()
-                candidates = {link_text, aria_label, title}
+                rel = (await link.get_attribute("rel") or "").strip()
+                candidates = {
+                    link_text.casefold(),
+                    aria_label.casefold(),
+                    title.casefold(),
+                    rel.casefold(),
+                }
                 if any(
                     next_text == candidate or next_text in candidate
                     for candidate in candidates
                     for next_text in self.pagination_next_texts
                 ):
                     await self.click_and_wait_for_results(page, link)
+                    if seen_record_numbers is not None:
+                        if await self.wait_for_new_result_records(page, seen_record_numbers):
+                            return True
+                        try:
+                            await link.evaluate("element => element.click()")
+                            return await self.wait_for_new_result_records(page, seen_record_numbers)
+                        except Exception:  # noqa: BLE001
+                            return False
                     return True
         return False
+
+    async def wait_for_new_result_records(
+        self,
+        page: Any,
+        seen_record_numbers: set[str],
+        timeout_ms: int = BROWSER_RESULTS_TIMEOUT_MS,
+    ) -> bool:
+        deadline = asyncio.get_running_loop().time() + (timeout_ms / 1000)
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                await self.wait_for_results_page(page)
+            except PlaywrightTimeoutError:
+                pass
+            loaded_record_numbers = await self.get_loaded_record_numbers(page)
+            if any(record_number not in seen_record_numbers for record_number in loaded_record_numbers):
+                return True
+            await page.wait_for_timeout(500)
+        return False
+
+    async def pagination_control_page_number(self, locator: Any) -> int | None:
+        values = [
+            (await locator.inner_text()).strip(),
+            (await locator.get_attribute("aria-label") or "").strip(),
+            (await locator.get_attribute("title") or "").strip(),
+            (await locator.get_attribute("data-page") or "").strip(),
+            (await locator.get_attribute("data-page-number") or "").strip(),
+        ]
+        for value in values:
+            if value.isdigit():
+                return int(value)
+            match = re.search(r"(?:page|go to page)\s+(\d+)", value, re.I)
+            if match:
+                return int(match.group(1))
+        return None
+
+    async def is_disabled_pagination_control(self, locator: Any) -> bool:
+        disabled = await locator.get_attribute("disabled")
+        aria_disabled = (await locator.get_attribute("aria-disabled") or "").strip().casefold()
+        class_name = (await locator.get_attribute("class") or "").strip().casefold()
+        parent_class_name = await locator.evaluate(
+            "element => element.parentElement ? element.parentElement.className || '' : ''"
+        )
+        parent_class_name = str(parent_class_name).casefold()
+        return (
+            disabled is not None
+            or aria_disabled == "true"
+            or "disabled" in class_name
+            or "disabled" in parent_class_name
+        )
+
+    async def print_pagination_stop_debug(
+        self,
+        page: Any,
+        processed_pages: set[int],
+        current_page_num: int,
+    ) -> None:
+        controls: list[dict[str, Any]] = []
+        locators = page.locator(self.pagination_control_selector)
+        for index in range(await locators.count()):
+            locator = locators.nth(index)
+            try:
+                if not await locator.is_visible():
+                    continue
+                controls.append(
+                    {
+                        "text": " ".join((await locator.inner_text()).split()),
+                        "aria_label": await locator.get_attribute("aria-label"),
+                        "title": await locator.get_attribute("title"),
+                        "class": await locator.get_attribute("class"),
+                        "disabled": await self.is_disabled_pagination_control(locator),
+                    }
+                )
+            except Exception:  # noqa: BLE001
+                continue
+
+        print("SmartGov pagination stop debug:")
+        print(f"  current_page_num: {current_page_num}")
+        print(f"  processed_pages: {sorted(processed_pages)}")
+        print(f"  visible_pagination_controls: {controls[:40]}")
 
     async def click_and_wait_for_results(self, page: Any, locator: Any) -> None:
         try:
@@ -557,14 +914,13 @@ class SmartGovPlaywrightWorkflow:
         option_text: str,
         category: str,
         page_num: int = 1,
+        seen_record_numbers: set[str] | None = None,
     ) -> tuple[str, list[dict[str, Any]]]:
         html = await page.content()
         self.result_pages_html.append(html)
         records = parse_rows(BeautifulSoup(html, "html.parser"), url)
         if not records:
-            raise RuntimeError(
-                f"No SmartGov records parsed for {option_text} page {page_num}; stopping this permit type."
-            )
+            return html, []
         records = [
             {
                 **record,
@@ -573,6 +929,26 @@ class SmartGovPlaywrightWorkflow:
             }
             for record in records
         ]
+        if seen_record_numbers is not None:
+            new_records = []
+            for record in records:
+                record_number = record.get("record_number")
+                if record_number and record_number in seen_record_numbers:
+                    continue
+                if record_number:
+                    seen_record_numbers.add(record_number)
+                new_records.append(record)
+            records = new_records
+            if not records:
+                return html, []
+
+        if not self.scrape_details:
+            print(f"Skipping detail pages for {len(records)} records on fast row-only mode.")
+            if self.result_batch_callback is not None:
+                self.result_batch_callback(records)
+            self.result_record_batches.append(records)
+            return html, records
+
         records = await self.enrich_records_with_details(page, records, url, option_text, page_num)
         if records:
             self.result_record_batches.append(records)
@@ -624,7 +1000,7 @@ class SmartGovPlaywrightWorkflow:
             )
         except Exception as exc:  # noqa: BLE001
             print(f"Failed to fetch detail for {record.get('record_number')}: {exc}")
-            raise
+            return record
         return merge_detail_fields(record, detail_result or {})
 
     async def fetch_detail_fields(
