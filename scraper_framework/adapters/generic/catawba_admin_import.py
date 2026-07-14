@@ -17,16 +17,22 @@ CATAWBA_SOURCE_URL = (
 CATAWBA_STATE = "North Carolina"
 CATAWBA_COUNTY = "Catawba"
 CATAWBA_PROVIDER = "smartgovcommunity"
+CATAWBA_COLLECTION_NAME = "north_carolina_smartgov"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Read Catawba permit documents from MongoDB and import them through the admin API."
     )
+    parser.add_argument(
+        "--collection-name",
+        default=CATAWBA_COLLECTION_NAME,
+        help="MongoDB collection to read SmartGov permit documents from.",
+    )
     parser.add_argument("--permit-id", help="Specific permits document _id to import.")
     parser.add_argument(
         "--source-url",
-        default=CATAWBA_SOURCE_URL,
+        default=None,
         help="Filter permit documents by source_url.",
     )
     parser.add_argument(
@@ -81,6 +87,18 @@ def main() -> int:
         return 1
 
     for result in results:
+        summary = result.get("summary", {})
+        duplicate_count = summary.get("duplicate_found_count", summary.get("skipped_count", 0))
+        new_count = summary.get("new_pushed_count", summary.get("record_count", 0))
+        print(
+            "collection={collection} county={county} duplicate found {duplicates} number new pushed {new_count} data mode={mode}".format(
+                collection=summary.get("collection_name", args.collection_name),
+                county=summary.get("county", args.county),
+                duplicates=duplicate_count,
+                new_count=new_count,
+                mode=result.get("mode"),
+            )
+        )
         print(result)
     return 0
 
@@ -90,6 +108,6 @@ if __name__ == "__main__":
 
 
 # cd /home/sourabh/CrawlPy/scraper_framework
-# python scraper_framework/adapters/generic/catawba_admin_import.py --dry-run
-# python scraper_framework/adapters/generic/catawba_admin_import.py
-# python scraper_framework/adapters/generic/catawba_admin_import.py --permit-id 6a4f8eb78c2f5424c57b36c4 --dry-run
+# python scraper_framework/adapters/generic/catawba_admin_import.py --collection-name north_carolina_smartgov --county Catawba --dry-run --limit 20
+# python scraper_framework/adapters/generic/catawba_admin_import.py --collection-name north_carolina_smartgov --county Catawba --limit 20
+# python scraper_framework/adapters/generic/catawba_admin_import.py --collection-name north_carolina_smartgov --county Catawba --permit-id 6a4f8eb78c2f5424c57b36c4 --dry-run

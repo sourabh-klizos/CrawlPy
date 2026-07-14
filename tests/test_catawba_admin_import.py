@@ -6,6 +6,7 @@ import sys
 sys.path.append(str(Path(__file__).resolve().parents[1] / "scraper_framework"))
 
 from adapters.generic.catawba_admin_import import (
+    CATAWBA_COLLECTION_NAME,
     CATAWBA_COUNTY,
     CATAWBA_PROVIDER,
     CATAWBA_SOURCE_URL,
@@ -21,3 +22,4 @@ def test_catawba_import_defaults_match_source() -> None:
     assert CATAWBA_STATE == "North Carolina"
     assert CATAWBA_COUNTY == "Catawba"
     assert CATAWBA_PROVIDER == "smartgovcommunity"
+    assert CATAWBA_COLLECTION_NAME == "north_carolina_smartgov"

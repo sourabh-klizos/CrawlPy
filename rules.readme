@@ -1,0 +1,67 @@
+Spartanburg Admin Import Rules
+==============================
+
+This file documents the current rule set for the Spartanburg admin import flow.
+
+Files
+-----
+
+- Script: `scraper_framework/adapters/generic/spartanburg_admin_import.py`
+- Tests: `tests/test_spartanburg_admin_import.py`
+
+Current Rules
+-------------
+
+1. Admin API payloads must be sent in chunks of 100 records.
+2. Duplicate filtering must happen before any API push by checking the `already_pushed` collection.
+3. Every successfully pushed record must be saved into the `already_pushed` collection so future runs can skip duplicates.
+4. Use `--dry-run` first when validating a new collection or a new permit shape.
+
+Current Default Collection
+--------------------------
+
+- `spartanburg_Construction_for_Commercial_Building`
+
+Also Supported
+--------------
+
+- `spartanburg_single_family`
+
+Command Notes
+-------------
+
+# Move into the repo area used by the script
+cd /home/sourabh/CrawlPy/scraper_framework
+
+# Dry run against the default Spartanburg commercial-building collection
+python scraper_framework/adapters/generic/spartanburg_admin_import.py --dry-run --limit 250
+
+# Dry run and print the payload JSON
+python scraper_framework/adapters/generic/spartanburg_admin_import.py --dry-run --print-payload --limit 5
+
+# Push live in chunks of 100
+python scraper_framework/adapters/generic/spartanburg_admin_import.py --limit 250
+
+# Push one specific document by _id
+python scraper_framework/adapters/generic/spartanburg_admin_import.py --dry-run --permit-id 67ed0cb1baac62c88764ac40
+
+# Run the older single-family collection through the same script
+python scraper_framework/adapters/generic/spartanburg_admin_import.py --collection-name spartanburg_single_family --dry-run --limit 250
+
+Expected Behavior
+-----------------
+
+- If 250 new records are ready to push, the script will make 3 API calls:
+  - chunk 1 -> 100 records
+  - chunk 2 -> 100 records
+  - chunk 3 -> 50 records
+- If some records already exist in `already_pushed`, they are skipped before chunking.
+- Only records that are actually pushed successfully are written back into `already_pushed`.
+
+Reminder
+--------
+
+If this rule changes later, update both:
+
+- `scraper_framework/adapters/generic/spartanburg_admin_import.py`
+- `tests/test_spartanburg_admin_import.py`

@@ -46,6 +46,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Read permit documents from MongoDB and import them through the admin API."
     )
+    parser.add_argument(
+        "--collection-name",
+        default="permits",
+        help="MongoDB collection to read permit documents from.",
+    )
     parser.add_argument("--permit-id", help="Specific permits document _id to import.")
     parser.add_argument("--source-url", help="Filter permit documents by source_url.")
     parser.add_argument("--state", help="Filter permit documents by state_name.")
@@ -107,7 +112,9 @@ def fetch_permits(store: MongoStore, query: dict[str, Any], limit: int | None) -
     if limit is not None and limit <= 0:
         raise ValueError("--limit must be greater than 0.")
 
-    cursor = store._collection("permits").find(query).sort("crawl_timestamp", -1)
+    collection_name = getattr(store, "collection_name", "permits")
+    sort_field = "crawl_timestamp" if collection_name == "permits" else "_id"
+    cursor = store._collection(collection_name).find(query).sort(sort_field, -1)
     if limit is not None:
         cursor = cursor.limit(limit)
     return list(cursor)
@@ -222,6 +229,34 @@ def build_payload_metadata(
     }
 
 
+def resolve_source_url(permit_document: dict[str, Any]) -> str | None:
+    raw_columns = permit_document.get("raw_columns")
+    if not isinstance(raw_columns, dict):
+        raw_columns = {}
+
+    raw_data = permit_document.get("raw_data")
+    if not isinstance(raw_data, dict):
+        raw_data = {}
+
+    return (
+        permit_document.get("source_url")
+        or raw_columns.get("source_url")
+        or raw_data.get("source_url")
+        or raw_data.get("detail_link")
+    )
+
+
+def enrich_document_for_payload(permit_document: dict[str, Any]) -> dict[str, Any]:
+    source_url = resolve_source_url(permit_document)
+    if source_url == permit_document.get("source_url"):
+        return permit_document
+
+    return {
+        **permit_document,
+        "source_url": source_url,
+    }
+
+
 def split_permits_for_push(
     permit_documents: list[dict[str, Any]],
     client: AdminPermitImportClient,
@@ -317,12 +352,18 @@ def persist_push_tracking(
 
 def run_import(args: argparse.Namespace, store: MongoStore | None = None) -> list[dict[str, Any]]:
     store = store or MongoStore()
+    setattr(store, "collection_name", getattr(args, "collection_name", "permits"))
     client = AdminPermitImportClient()
     query = build_query(args)
-    permit_documents = apply_state_overrides(fetch_permits(store, query, args.limit), cli_state=args.state)
+    permit_documents = [
+        enrich_document_for_payload(document)
+        for document in apply_state_overrides(fetch_permits(store, query, args.limit), cli_state=args.state)
+    ]
 
     if not permit_documents:
-        raise ValueError(f"No permits documents matched query: {query}")
+        raise ValueError(
+            f"No permits documents matched query in collection '{store.collection_name}': {query}"
+        )
 
     permits_to_push, skipped = split_permits_for_push(
         permit_documents,
@@ -338,7 +379,10 @@ def run_import(args: argparse.Namespace, store: MongoStore | None = None) -> lis
                 "mode": "skip",
                 "summary": {
                     "permit_ids": [str(document.get("_id")) for document in permit_documents],
+                    "collection_name": store.collection_name,
                     "skipped_count": len(skipped),
+                    "duplicate_found_count": len(skipped),
+                    "new_pushed_count": 0,
                     "tracking_collection": TRACKING_COLLECTION,
                 },
                 "skipped": skipped,
@@ -353,7 +397,10 @@ def run_import(args: argparse.Namespace, store: MongoStore | None = None) -> lis
     )
     payload = build_api_payload(full_payload)
     summary = summarize_payload(permits_to_push, full_payload)
+    summary["collection_name"] = store.collection_name
     summary["skipped_count"] = len(skipped)
+    summary["duplicate_found_count"] = len(skipped)
+    summary["new_pushed_count"] = len(permits_to_push)
     summary["tracking_collection"] = TRACKING_COLLECTION
 
     if args.print_payload or args.dry_run:

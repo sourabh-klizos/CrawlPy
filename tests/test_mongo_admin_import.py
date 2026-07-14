@@ -10,11 +10,18 @@ import pytest
 
 sys.path.append(str(Path(__file__).resolve().parents[1] / "scraper_framework"))
 
-from adapters.accela.mongo_admin_import import apply_state_overrides, build_api_payload, build_query, run_import
+from adapters.accela.mongo_admin_import import (
+    apply_state_overrides,
+    build_api_payload,
+    build_query,
+    fetch_permits,
+    run_import,
+)
 
 
 def _args(**overrides: object) -> Namespace:
     defaults = {
+        "collection_name": "permits",
         "permit_id": None,
         "source_url": None,
         "state": None,
@@ -151,6 +158,7 @@ def test_run_import_returns_dry_run_summary_without_push() -> None:
 
     assert results[0]["mode"] == "dry-run"
     assert results[0]["summary"]["permit_ids"] == ["permit-1"]
+    assert results[0]["summary"]["collection_name"] == "permits"
     assert results[0]["summary"]["adapter_name"] == "accela"
     assert results[0]["summary"]["state"] == "FL"
     assert results[0]["summary"]["county"] == "Polk County"
@@ -160,6 +168,8 @@ def test_run_import_returns_dry_run_summary_without_push() -> None:
     assert results[0]["summary"]["record_count"] == 1
     assert results[0]["summary"]["import_run_id"].startswith("python-")
     assert results[0]["summary"]["skipped_count"] == 0
+    assert results[0]["summary"]["duplicate_found_count"] == 0
+    assert results[0]["summary"]["new_pushed_count"] == 1
     assert results[0]["summary"]["tracking_collection"] == "already_pushed"
     assert results[0]["skipped"] == []
 
@@ -301,6 +311,7 @@ def test_run_import_pushes_payload_when_not_dry_run(monkeypatch: pytest.MonkeyPa
             "mode": "push",
             "summary": {
                 "permit_ids": ["permit-2"],
+                "collection_name": "permits",
                 "adapter_name": "accela",
                 "state": "FL",
                 "county": "Polk County",
@@ -310,6 +321,8 @@ def test_run_import_pushes_payload_when_not_dry_run(monkeypatch: pytest.MonkeyPa
                 "record_count": 1,
                 "import_run_id": "python-2026-07-10T12:00:00Z",
                 "skipped_count": 0,
+                "duplicate_found_count": 0,
+                "new_pushed_count": 1,
                 "tracking_collection": "already_pushed",
             },
             "response": {"job_id": "job-123"},
@@ -375,7 +388,10 @@ def test_run_import_skips_permits_already_pushed(monkeypatch: pytest.MonkeyPatch
             "mode": "skip",
             "summary": {
                 "permit_ids": ["permit-3"],
+                "collection_name": "permits",
                 "skipped_count": 1,
+                "duplicate_found_count": 1,
+                "new_pushed_count": 0,
                 "tracking_collection": "already_pushed",
             },
             "skipped": [
@@ -389,3 +405,91 @@ def test_run_import_skips_permits_already_pushed(monkeypatch: pytest.MonkeyPatch
         }
     ]
     assert results[0]["skipped"][0]["payload_hash"]
+
+
+def test_run_import_reads_from_requested_collection_and_resolves_source_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    permit_document = {
+        "_id": "permit-4",
+        "adapter_name": "smartgovcommunity",
+        "county_name": "Alexander",
+        "normalized_data": {
+            "record_number": "BPR-26-0060",
+            "record_type": "New Residential or Commercial",
+            "address": "2724 LITTLE RIVER CHURCH RD",
+            "status": "Additional Information Requested",
+            "issue_date": "7/9/2026",
+            "description": "New Residential or Commercial",
+        },
+        "raw_data": {
+            "record_number": "BPR-26-0060",
+            "record_type": "New Residential or Commercial",
+            "address": "2724 LITTLE RIVER CHURCH RD",
+        },
+        "raw_columns": {
+            "source_url": "https://co-alexander-nc.smartgovcommunity.com/ApplicationPublic/ApplicationSearchAdvanced/Search",
+        },
+    }
+    fake_collection = Mock()
+    fake_collection.find.return_value.sort.return_value = [permit_document]
+    fake_store = SimpleNamespace(
+        _collection=Mock(return_value=fake_collection),
+        find_already_pushed=Mock(return_value=None),
+    )
+
+    fake_client = SimpleNamespace(
+        build_payload_from_permit_documents=Mock(
+            return_value={
+                "provider": "smartgovcommunity",
+                "state": "North Carolina",
+                "county": "Alexander",
+                "agency": None,
+                "module": None,
+                "source_url": "https://co-alexander-nc.smartgovcommunity.com/ApplicationPublic/ApplicationSearchAdvanced/Search",
+                "exclude_tmp": True,
+                "only_issued_active": False,
+                "exclude_statuses": ["Withdrawn"],
+                "import_run_id": "python-2026-07-10T12:00:00Z",
+                "records": [{"record_number": "BPR-26-0060"}],
+            }
+        ),
+        build_record=Mock(
+            return_value={
+                "record_number": "BPR-26-0060",
+                "permit_type": "New Residential or Commercial",
+                "address": "2724 LITTLE RIVER CHURCH RD",
+                "date": "7/9/2026",
+            }
+        ),
+    )
+    monkeypatch.setattr("adapters.accela.mongo_admin_import.AdminPermitImportClient", lambda: fake_client)
+
+    results = run_import(
+        _args(
+            collection_name="north_carolina_smartgov",
+            state="North Carolina",
+            county="Alexander",
+            dry_run=True,
+        ),
+        store=fake_store,
+    )
+
+    fake_store._collection.assert_called_with("north_carolina_smartgov")
+    payload_call = fake_client.build_payload_from_permit_documents.call_args
+    assert payload_call.args[0][0]["source_url"] == (
+        "https://co-alexander-nc.smartgovcommunity.com/ApplicationPublic/ApplicationSearchAdvanced/Search"
+    )
+    assert results[0]["summary"]["collection_name"] == "north_carolina_smartgov"
+
+
+def test_fetch_permits_uses_object_id_sort_for_non_permits_collection() -> None:
+    fake_cursor = Mock()
+    fake_cursor.sort.return_value = []
+    fake_collection = Mock()
+    fake_collection.find.return_value = fake_cursor
+    fake_store = SimpleNamespace(
+        collection_name="north_carolina_smartgov",
+        _collection=Mock(return_value=fake_collection),
+    )
+
+    assert fetch_permits(fake_store, {"county_name": "Alexander"}, None) == []
+    fake_cursor.sort.assert_called_once_with("_id", -1)
