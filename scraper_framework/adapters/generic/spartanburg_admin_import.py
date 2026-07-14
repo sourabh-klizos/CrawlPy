@@ -35,7 +35,7 @@ CHUNK_SIZE = 100
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Read Spartanburg County single-family permit documents from MongoDB "
+            "Read Spartanburg County permit documents from MongoDB "
             "and import them through the admin API."
         )
     )
@@ -409,9 +409,9 @@ if __name__ == "__main__":
 
 
 # cd /home/sourabh/CrawlPy/scraper_framework
-# python scraper_framework/adapters/generic/spartanburg_admin_import.py --dry-run --limit 20
-# python scraper_framework/adapters/generic/spartanburg_admin_import.py --dry-run --permit-id 67ed290761cc1c388a8adf9b
-# python scraper_framework/adapters/generic/spartanburg_admin_import.py --print-payload --dry-run --limit 5
-# python scraper_framework/adapters/generic/spartanburg_admin_import.py --limit 20
+# python scraper_framework/adapters/generic/spartanburg_admin_import.py --collection-name spartanburg_Construction_for_Commercial_Building --dry-run --limit 20
+# python scraper_framework/adapters/generic/spartanburg_admin_import.py --collection-name spartanburg_Construction_for_Commercial_Building --dry-run --permit-id 67ed290761cc1c388a8adf9b
+# python scraper_framework/adapters/generic/spartanburg_admin_import.py --collection-name spartanburg_Construction_for_Commercial_Building --print-payload --dry-run --limit 5
+# python scraper_framework/adapters/generic/spartanburg_admin_import.py --collection-name spartanburg_Construction_for_Commercial_Building --limit 20
 # python scraper_framework/adapters/generic/spartanburg_admin_import.py --collection-name spartanburg_single_family --dry-run --limit 20
 # python scraper_framework/adapters/generic/spartanburg_admin_import.py --collection-name spartanburg_Construction_for_Commercial_Building --dry-run --limit 20
